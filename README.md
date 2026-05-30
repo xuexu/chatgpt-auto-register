@@ -151,6 +151,8 @@ python icloud_hme.py export-cookies
 
 - [heartmore/icloud-hme](https://github.com/heartmore/icloud-hme) — iCloud Hide My Email 纯协议管理，一键导出 cookies，搭配本工具完成全链路注册
 
+🔗 友情链接：[LINUX DO](https://linux.do/)
+
 ---
 
 ## 致谢
