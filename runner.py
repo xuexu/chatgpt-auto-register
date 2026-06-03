@@ -40,6 +40,24 @@ def get_email_for_user(user_id: int, sse_q: queue.Queue) -> str:
                 db.consume_icloud_use(icloud["id"])
                 raise RuntimeError(f"iCloud failed: {e}")
     else:
+        tempmail_base_url = db.get_admin_asset("tempmail_base_url") or ""
+        tempmail_admin_auth = db.get_admin_asset("tempmail_admin_auth") or ""
+        if tempmail_base_url:
+            sse_q.put({"msg": "Using TempMail email (free)...", "tag": "info", "time": _ts()})
+            with mailmanage_lock:
+                try:
+                    from tempmail_client import TempMailClient
+                    tm = TempMailClient(
+                        base_url=tempmail_base_url,
+                        admin_auth=tempmail_admin_auth,
+                        domain=db.get_admin_asset("tempmail_domain") or "",
+                        site_password=db.get_admin_asset("tempmail_site_password") or "",
+                        verbose=False,
+                    )
+                    return tm.get_available_email()
+                except Exception as e:
+                    sse_q.put({"msg": f"TempMail failed, fallback to MailManage: {e}", "tag": "warn", "time": _ts()})
+
         sse_q.put({"msg": "Using MailManage email (free)...", "tag": "info", "time": _ts()})
         with mailmanage_lock:
             from mailmanage_client import MailManageClient
@@ -160,6 +178,14 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
             if result["ok"]:
                 ok_count += 1
+                if email:
+                    try:
+                        from tempmail_client import TempMailClient
+                        tempmail_base_url = db.get_admin_asset("tempmail_base_url") or ""
+                        if tempmail_base_url and email.lower() in getattr(TempMailClient(tempmail_base_url), "_tokens", {}):
+                            TempMailClient(tempmail_base_url).mark_used(email)
+                    except Exception:
+                        pass
                 sse_q.put({"msg": f"OK: {phone} -> {email}", "tag": "success", "time": _ts()})
             else:
                 sse_q.put({"msg": f"FAIL: {phone} - {result.get('error','')}", "tag": "error", "time": _ts()})

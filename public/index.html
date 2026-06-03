@@ -96,6 +96,10 @@ th{color:#8b6f4e;font-weight:600}
 
   <div class="card"><h2>管理员资产</h2>
     <label>MailManage API Key</label><input id="asset-mmkey">
+    <label>TempMail Worker URL</label><input id="asset-tm-base" placeholder="https://mail.example.com">
+    <label>TempMail Admin Auth</label><input id="asset-tm-auth" type="password">
+    <label>TempMail Domain</label><input id="asset-tm-domain" placeholder="example.com">
+    <label>TempMail Site Password (optional)</label><input id="asset-tm-site" type="password">
     <label>iCloud Cookies (JSON)</label><textarea id="asset-icloud" rows="3" style="width:100%" placeholder='{"X-APPLE-...": "..."}'></textarea>
     <button class="primary" style="margin-top:8px" onclick="saveAssets()">保存</button>
   </div>
@@ -213,7 +217,14 @@ function genCards(){
 function revokeInvite(id){if(confirm('吊销该邀请码？'))fetch('/api/admin/invite/'+id,{method:'DELETE',headers:auth()}).then(function(){refreshAdmin();});}
 function revokeCard(id){if(confirm('吊销该卡密？'))fetch('/api/admin/card/'+id,{method:'DELETE',headers:auth()}).then(function(){refreshAdmin();});}
 function saveAssets(){
-  fetch('/api/admin/assets',{method:'PUT',headers:auth(),body:JSON.stringify({mailmanage_key:G('asset-mmkey').value,icloud_cookies:G('asset-icloud').value})})
+  fetch('/api/admin/assets',{method:'PUT',headers:auth(),body:JSON.stringify({
+    mailmanage_key:G('asset-mmkey').value,
+    icloud_cookies:G('asset-icloud').value,
+    tempmail_base_url:G('asset-tm-base').value,
+    tempmail_admin_auth:G('asset-tm-auth').value,
+    tempmail_domain:G('asset-tm-domain').value,
+    tempmail_site_password:G('asset-tm-site').value
+  })})
   .then(function(r){return r.json()}).then(function(j){toast(j.ok?'保存成功':'保存失败',j.ok);});
 }
 

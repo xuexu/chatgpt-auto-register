@@ -21,6 +21,11 @@
         "sub2api_email": "",
         "sub2api_password": "",
         "sub2api_group": "CHATGPT",
+        "email_provider": "icloud",
+        "tempmail_base_url": "",
+        "tempmail_admin_auth": "",
+        "tempmail_domain": "",
+        "tempmail_site_password": "",
         "bind_email": ""
     }
 }

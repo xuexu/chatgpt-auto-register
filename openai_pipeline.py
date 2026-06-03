@@ -57,7 +57,12 @@ class FullPipeline:
         email_provider: str = "",
         mailmanage_api_key: str = "",
         mailmanage_base_url: str = "",
+        mailmanage_category: str = "free",
         mailmanage_keyword: str = "",
+        tempmail_base_url: str = "",
+        tempmail_admin_auth: str = "",
+        tempmail_domain: str = "",
+        tempmail_site_password: str = "",
         icloud_cookies: Dict = None,
         sub2api_url: str = "",
         sub2api_email: str = "",
@@ -74,6 +79,11 @@ class FullPipeline:
         self.mailmanage_base_url = mailmanage_base_url or ""
         self.mailmanage_category = mailmanage_category
         self.mailmanage_keyword = mailmanage_keyword
+        self.tempmail_base_url = tempmail_base_url
+        self.tempmail_admin_auth = tempmail_admin_auth
+        self.tempmail_domain = tempmail_domain
+        self.tempmail_site_password = tempmail_site_password
+        self.tempmail_jwt = ""
         self.icloud_cookies = icloud_cookies or {}
         self.sub2api_url = sub2api_url.rstrip("/") if sub2api_url else ""
         self.sub2api_email = sub2api_email
@@ -200,6 +210,34 @@ class FullPipeline:
             self.log(f"MailManage 失败: {e}")
             return None
 
+    def _get_tempmail_email(self) -> Optional[str]:
+        from tempmail_client import TempMailClient
+
+        try:
+            client = TempMailClient(
+                base_url=self.tempmail_base_url,
+                admin_auth=self.tempmail_admin_auth,
+                domain=self.tempmail_domain,
+                site_password=self.tempmail_site_password,
+                verbose=self.verbose,
+            )
+            data = client.create_address()
+            email = data["email"]
+            self.tempmail_jwt = data.get("jwt", "")
+            self.log(f"TempMail selected: {email}")
+            return email
+        except Exception as e:
+            self.log(f"TempMail failed: {e}")
+            return None
+
+    def get_email(self) -> Optional[str]:
+        provider = (self.email_provider or "icloud").lower()
+        if provider == "tempmail":
+            return self._get_tempmail_email()
+        if provider == "mailmanage":
+            return self._get_mailmanage_email()
+        return self.create_icloud_alias()
+
     # ============================================================
     # 后半段: 绑邮箱 + OAuth 重登录 + 上传
     # ============================================================
@@ -245,6 +283,10 @@ class FullPipeline:
                 sub2api_proxy_id=self.sub2api_proxy_id,
                 proxy=self.proxy,
                 verbose=self.verbose,
+                email_provider=self.email_provider or "icloud",
+                tempmail_base_url=self.tempmail_base_url,
+                tempmail_jwt=self.tempmail_jwt,
+                tempmail_site_password=self.tempmail_site_password,
                 mailmanage_api_key=self.mailmanage_api_key,
                 mailmanage_base_url=self.mailmanage_base_url,
                 mailmanage_keyword=self.mailmanage_keyword,
@@ -386,7 +428,7 @@ class FullPipeline:
         results.update(reg)
 
         # ---- iCloud 别名 ----
-        email = self.create_icloud_alias()
+        email = self.get_email()
         results["email"] = email
 
         # ---- Phase 2: 手机OAuth → 绑邮箱 → 验证 → 同意 → code → 上传 ----
@@ -399,7 +441,8 @@ class FullPipeline:
             oauth_url=oauth_url,
         )
 
-        if ok and self.email_provider == "mailmanage" and email:
+        provider = (self.email_provider or "icloud").lower()
+        if ok and provider == "mailmanage" and email:
             try:
                 from mailmanage_client import MailManageClient
                 mc = MailManageClient(
@@ -410,6 +453,17 @@ class FullPipeline:
                 mc.mark_used(email)
             except Exception as e:
                 self.log(f"MailManage 标记已用失败: {e}")
+        if ok and provider == "tempmail" and email:
+            try:
+                from tempmail_client import TempMailClient
+                tc = TempMailClient(
+                    base_url=self.tempmail_base_url,
+                    site_password=self.tempmail_site_password,
+                    verbose=self.verbose,
+                )
+                tc.mark_used(email)
+            except Exception as e:
+                self.log(f"TempMail mark used failed: {e}")
 
         print("=" * 50)
         if ok:
@@ -441,6 +495,10 @@ def resume_pipeline(
     sub2api_proxy_id: int = 0,
     proxy: str = "",
     verbose: bool = True,
+    email_provider: str = "icloud",
+    tempmail_base_url: str = "",
+    tempmail_jwt: str = "",
+    tempmail_site_password: str = "",
     mailmanage_api_key: str = "",
     mailmanage_base_url: str = "",
     mailmanage_keyword: str = "gpt",
@@ -460,6 +518,10 @@ def resume_pipeline(
         sub2api_proxy_id=sub2api_proxy_id,
         proxy=proxy,
         verbose=verbose,
+        email_provider=email_provider,
+        tempmail_base_url=tempmail_base_url,
+        tempmail_jwt=tempmail_jwt,
+        tempmail_site_password=tempmail_site_password,
         mailmanage_api_key=mailmanage_api_key,
         mailmanage_base_url=mailmanage_base_url,
         mailmanage_keyword=mailmanage_keyword,
@@ -489,25 +551,33 @@ def main():
     p.add_argument("--sub2api-email", default="")
     p.add_argument("--sub2api-password", default="")
     p.add_argument("--sub2api-proxy-id", type=int, default=0)
-    p.add_argument("--email-provider", default="", help="邮箱 provider (icloud / mailmanage)")
+    p.add_argument("--email-provider", default="", help="email provider (icloud / mailmanage / tempmail)")
     p.add_argument("--mailmanage-key", default="", help="MailManage API Key (mak_xxx)")
     p.add_argument("--mailmanage-base-url", default="", help="MailManage 地址")
     p.add_argument("--mailmanage-category", default="free", help="MailManage 分类")
     p.add_argument("--mailmanage-keyword", default="gpt", help="MailManage 关键词")
+    p.add_argument("--tempmail-base-url", default="", help="cloudflare_temp_email Worker URL")
+    p.add_argument("--tempmail-admin-auth", default="", help="cloudflare_temp_email x-admin-auth")
+    p.add_argument("--tempmail-domain", default="", help="cloudflare_temp_email mailbox domain")
+    p.add_argument("--tempmail-site-password", default="", help="optional x-custom-auth")
     p.add_argument("--verbose", "-v", action="store_true")
 
     # resume
     p2 = sub.add_parser("resume", help="执行后半段 OAuth 流程")
     p2.add_argument("--oauth-url", required=True, help="OAuth 授权 URL (从SUB2API获取)")
     p2.add_argument("--phone", required=True, help="注册手机号 (含国家码)")
-    p2.add_argument("--email", required=True, help="iCloud 邮箱别名")
+    p2.add_argument("--email", required=True, help="邮箱地址")
     p2.add_argument("--password", required=True, help="ChatGPT 密码")
-    p2.add_argument("--icloud-cookies", required=True, help="iCloud cookies.json")
+    p2.add_argument("--icloud-cookies", default="", help="iCloud cookies.json")
     p2.add_argument("--proxy", default="")
     p2.add_argument("--sub2api-url", required=True)
     p2.add_argument("--sub2api-email", required=True)
     p2.add_argument("--sub2api-password", required=True)
     p2.add_argument("--sub2api-proxy-id", type=int, default=0)
+    p2.add_argument("--email-provider", default="icloud", help="email provider (icloud / mailmanage / tempmail)")
+    p2.add_argument("--tempmail-base-url", default="", help="cloudflare_temp_email Worker URL")
+    p2.add_argument("--tempmail-jwt", default="", help="cloudflare_temp_email address JWT")
+    p2.add_argument("--tempmail-site-password", default="", help="optional x-custom-auth")
     p2.add_argument("--verbose", "-v", action="store_true")
 
     # only-oauth — 测试 OAuth 流程
@@ -535,6 +605,10 @@ def main():
             mailmanage_base_url=args.mailmanage_base_url,
             mailmanage_category=args.mailmanage_category,
             mailmanage_keyword=args.mailmanage_keyword,
+            tempmail_base_url=args.tempmail_base_url,
+            tempmail_admin_auth=args.tempmail_admin_auth,
+            tempmail_domain=args.tempmail_domain,
+            tempmail_site_password=args.tempmail_site_password,
             icloud_cookies=load_json(args.icloud_cookies),
             sub2api_url=args.sub2api_url,
             sub2api_email=args.sub2api_email,
@@ -557,6 +631,10 @@ def main():
             sub2api_proxy_id=args.sub2api_proxy_id,
             proxy=args.proxy,
             verbose=args.verbose,
+            email_provider=args.email_provider,
+            tempmail_base_url=args.tempmail_base_url,
+            tempmail_jwt=args.tempmail_jwt,
+            tempmail_site_password=args.tempmail_site_password,
         )
         print(f"\n结果: {'成功' if ok else '失败'}")
 

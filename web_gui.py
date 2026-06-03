@@ -61,11 +61,11 @@ def _load_config():
             cfg = _state["config"]
             # 合并所有顶层简单字段
             for k in ("proxy", "country", "service", "max_price", "sms_timeout",
-                      "code_timeout", "bind_email"):
+                      "code_timeout", "bind_email", "email_provider"):
                 if k in saved:
                     cfg[k] = saved[k]
             # 合并嵌套对象
-            for section in ("smsbower", "register", "icloud", "sub2api"):
+            for section in ("smsbower", "register", "icloud", "sub2api", "tempmail"):
                 if section in saved and isinstance(saved[section], dict):
                     cfg.setdefault(section, {})
                     cfg[section].update(saved[section])
@@ -86,6 +86,8 @@ _state = {
         "sms_timeout": 30,
         "code_timeout": 30,
         "icloud": {"user": "", "pass": ""},
+        "email_provider": "icloud",
+        "tempmail": {"base_url": "", "admin_auth": "", "domain": "", "site_password": ""},
         "sub2api": {"url": "", "email": "", "pwd": "", "group": "CHATGPT", "proxy_id": 0},
         "bind_email": "",
     },
@@ -124,14 +126,21 @@ def api_config():
         cfg = _state["config"]
         for k in ["api_key", "proxy", "country", "max_price", "sms_timeout",
                    "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
-                   "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email"]:
+                   "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email",
+                   "email_provider", "tempmail_base_url", "tempmail_admin_auth",
+                   "tempmail_domain", "tempmail_site_password"]:
             if k in d and d[k] is not None:
                 if k == "api_key": cfg["smsbower"]["api_key"] = d[k]
                 elif k == "password": cfg["register"]["password"] = d[k]
                 elif k in ("sms_timeout",): cfg[k] = int(d[k]) if d[k] else 30
                 elif k in ("proxy", "country", "max_price"): cfg[k] = d[k]
+                elif k == "email_provider": cfg["email_provider"] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
+                elif k == "tempmail_base_url": cfg["tempmail"] = cfg.get("tempmail", {}); cfg["tempmail"]["base_url"] = d[k]
+                elif k == "tempmail_admin_auth": cfg["tempmail"] = cfg.get("tempmail", {}); cfg["tempmail"]["admin_auth"] = d[k]
+                elif k == "tempmail_domain": cfg["tempmail"] = cfg.get("tempmail", {}); cfg["tempmail"]["domain"] = d[k]
+                elif k == "tempmail_site_password": cfg["tempmail"] = cfg.get("tempmail", {}); cfg["tempmail"]["site_password"] = d[k]
                 elif k == "sub2api_url": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["url"] = d[k]
                 elif k == "sub2api_email": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["email"] = d[k]
                 elif k == "sub2api_pwd": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["pwd"] = d[k]
@@ -267,6 +276,34 @@ class _WorkerLogIO:
             self._buf = ""
 
 
+def _new_tempmail_address(cfg: dict, verbose: bool = False) -> tuple[str, str]:
+    from tempmail_client import TempMailClient
+
+    tm_cfg = cfg.get("tempmail", {})
+    tm = TempMailClient(
+        base_url=tm_cfg.get("base_url", ""),
+        admin_auth=tm_cfg.get("admin_auth", ""),
+        domain=tm_cfg.get("domain", ""),
+        site_password=tm_cfg.get("site_password", ""),
+        verbose=verbose,
+    )
+    data = tm.create_address()
+    return data["email"], data.get("jwt", "")
+
+
+def _mark_tempmail_used(cfg: dict, email: str):
+    if not email:
+        return
+    from tempmail_client import TempMailClient
+
+    tm_cfg = cfg.get("tempmail", {})
+    TempMailClient(
+        base_url=tm_cfg.get("base_url", ""),
+        site_password=tm_cfg.get("site_password", ""),
+        verbose=False,
+    ).mark_used(email)
+
+
 def _run(config, count, retries, stop_event):
     cfg = dict(config)  # copy
     wid = 1
@@ -292,9 +329,22 @@ def _run(config, count, retries, stop_event):
 
     sub = cfg.get("sub2api", {})
     bind_email = cfg.get("bind_email", "")
+    email_provider = (cfg.get("email_provider") or "icloud").lower()
+    tempmail_jwt = ""
+
+    if not bind_email and sub.get("url") and email_provider == "tempmail":
+        with icloud_lock:
+            try:
+                bind_email, tempmail_jwt = _new_tempmail_address(cfg)
+                _log(f"TempMail邮箱: {bind_email}", "success", wid)
+                if bind_email:
+                    with _claimed_lock:
+                        _claimed_emails.add(bind_email)
+            except Exception as e:
+                _log(f"TempMail失败: {e}", "error", wid)
 
     # ── 获取 iCloud 邮箱 ──
-    if not bind_email and sub.get("url"):
+    if not bind_email and sub.get("url") and email_provider != "tempmail":
         with icloud_lock:
             try:
                 cookies = _load_icloud_cookies()
@@ -385,11 +435,24 @@ def _run(config, count, retries, stop_event):
                     _phase2_try = 0
                     oauth_result = None
                     _current_email = bind_email
+                    _current_tempmail_jwt = tempmail_jwt
 
                     while _phase2_try < _max_phase2_retries:
                         _phase2_try += 1
 
-                        if _phase2_try >= _max_phase2_retries:
+                        if _phase2_try >= _max_phase2_retries and email_provider == "tempmail":
+                            try:
+                                _current_email, _current_tempmail_jwt = _new_tempmail_address(cfg)
+                                _log(f"  [3/4] TempMail final retry with new address: {_current_email}", "success", wid)
+                                bind_email = _current_email
+                                cfg["bind_email"] = _current_email
+                                if _current_email:
+                                    with _claimed_lock:
+                                        _claimed_emails.add(_current_email)
+                            except Exception as e2:
+                                _log(f"  [3/4] TempMail create new address failed: {e2}", "error", wid)
+
+                        if _phase2_try >= _max_phase2_retries and email_provider != "tempmail":
                             with icloud_lock:
                                 try:
                                     cookies = _load_icloud_cookies()
@@ -417,6 +480,10 @@ def _run(config, count, retries, stop_event):
                             icloud_cookies={},
                             imap_user=cfg.get("icloud", {}).get("user", ""),
                             imap_password=cfg.get("icloud", {}).get("pass", ""),
+                            email_provider=email_provider,
+                            tempmail_base_url=cfg.get("tempmail", {}).get("base_url", ""),
+                            tempmail_jwt=_current_tempmail_jwt,
+                            tempmail_site_password=cfg.get("tempmail", {}).get("site_password", ""),
                             sub2api_url=sub["url"],
                             sub2api_email=sub["email"],
                             sub2api_password=sub.get("pwd", ""),
@@ -435,6 +502,19 @@ def _run(config, count, retries, stop_event):
                                 with _blacklist_lock:
                                     _email_blacklist.add(_current_email)
                                 _save_email_blacklist()
+                            if email_provider == "tempmail":
+                                try:
+                                    _current_email, _current_tempmail_jwt = _new_tempmail_address(cfg)
+                                    bind_email = _current_email
+                                    cfg["bind_email"] = _current_email
+                                    if _current_email:
+                                        with _claimed_lock:
+                                            _claimed_emails.add(_current_email)
+                                    _log(f"  [3/4] TempMail changed address: {_current_email}", "success", wid)
+                                    continue
+                                except Exception as e2:
+                                    _log(f"  [3/4] TempMail change address failed: {e2}", "error", wid)
+                                    break
                             with icloud_lock:
                                 try:
                                     cookies = _load_icloud_cookies()
@@ -476,6 +556,11 @@ def _run(config, count, retries, stop_event):
                         if w: w["status"] = f"✅ 完成 SUB2API#{aid}"
                         _log(f"  [4/4] 上传成功! SUB2API id={aid}", "success", wid)
                         result["sub2api_id"] = aid
+                        if email_provider == "tempmail" and _current_email:
+                            try:
+                                _mark_tempmail_used(cfg, _current_email)
+                            except Exception:
+                                pass
                     else:
                         if w: w["status"] = "❌ Phase2失败"
                         _log(f"  [4/4] OAuth失败: {oauth_result.get('error','?') if oauth_result else 'no result'}", "error", wid)
@@ -618,6 +703,13 @@ hr{border-color:#e0cda7;margin:8px 0}
   <details style="margin-top:10px">
     <summary>iCloud 邮箱 &amp; SUB2API</summary>
     <label>iCloud 邮箱 (IMAP)</label>
+    <label>Email Provider</label>
+    <select id="email_provider">
+      <option value="icloud">iCloud</option>
+      <option value="tempmail">TempMail</option>
+      <option value="mailmanage">MailManage</option>
+    </select>
+    <label>iCloud Email (IMAP)</label>
     <input id="imap_user" placeholder="xxx@icloud.com">
     <label>Apple 专用密码</label>
     <input id="imap_pass" type="password" placeholder="">
@@ -629,6 +721,18 @@ hr{border-color:#e0cda7;margin:8px 0}
     <input id="sub2api_pwd" type="password" placeholder="">
     <label>绑定邮箱 (手动指定)</label>
     <input id="bind_email" placeholder="alias@icloud.com">
+  </details>
+
+  <details style="margin-top:6px">
+    <summary>TempMail</summary>
+    <label>Worker URL</label>
+    <input id="tempmail_base_url" placeholder="https://mail.example.com">
+    <label>Admin Auth</label>
+    <input id="tempmail_admin_auth" type="password" placeholder="x-admin-auth">
+    <label>Domain</label>
+    <input id="tempmail_domain" placeholder="example.com">
+    <label>Site Password</label>
+    <input id="tempmail_site_password" type="password" placeholder="optional x-custom-auth">
   </details>
 
   <details style="margin-top:6px">
@@ -699,7 +803,12 @@ function saveConfig(){
     sms_timeout:G('sms_timeout').value,
     imap_user:G('imap_user').value,imap_pass:G('imap_pass').value,
     sub2api_url:G('sub2api_url').value,sub2api_email:G('sub2api_email').value,
-    sub2api_pwd:G('sub2api_pwd').value,bind_email:G('bind_email').value};
+    sub2api_pwd:G('sub2api_pwd').value,bind_email:G('bind_email').value,
+    email_provider:G('email_provider').value,
+    tempmail_base_url:G('tempmail_base_url').value,
+    tempmail_admin_auth:G('tempmail_admin_auth').value,
+    tempmail_domain:G('tempmail_domain').value,
+    tempmail_site_password:G('tempmail_site_password').value};
   return fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
     .then(function(r){return r.json()}).then(function(j){toast('配置已保存',j.ok);return j;});
 }
@@ -797,6 +906,13 @@ function loadConfig(){
       G('sub2api_url').value=c.sub2api.url||'';
       G('sub2api_email').value=c.sub2api.email||'';
       G('sub2api_pwd').value=c.sub2api.pwd||'';
+    }
+    G('email_provider').value=c.email_provider||'icloud';
+    if(c.tempmail){
+      G('tempmail_base_url').value=c.tempmail.base_url||'';
+      G('tempmail_admin_auth').value=c.tempmail.admin_auth||'';
+      G('tempmail_domain').value=c.tempmail.domain||'';
+      G('tempmail_site_password').value=c.tempmail.site_password||'';
     }
     G('bind_email').value=c.bind_email||'';
     checkBalance();

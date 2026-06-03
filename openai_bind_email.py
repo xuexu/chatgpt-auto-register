@@ -59,6 +59,68 @@ def _log(msg: str):
     print(f"  [AUTH] {msg}")
 
 
+def _poll_email_code(
+    provider: str,
+    target_email: str,
+    icloud_cookies: Dict[str, str],
+    verbose: bool,
+    imap_user: str = "",
+    imap_password: str = "",
+    tempmail_base_url: str = "",
+    tempmail_jwt: str = "",
+    tempmail_site_password: str = "",
+    mailmanage_api_key: str = "",
+    mailmanage_base_url: str = "",
+    mailmanage_keyword: str = "gpt",
+    timeout: int = 60,
+) -> Optional[str]:
+    """Poll a supported mailbox provider for a 6-digit OpenAI binding code."""
+    provider = (provider or "icloud").lower()
+    sender_filters = ["openai", "noreply", "verification", "no-reply"]
+
+    if provider == "tempmail":
+        from tempmail_client import TempMailClient
+
+        client = TempMailClient(
+            base_url=tempmail_base_url,
+            site_password=tempmail_site_password,
+            verbose=verbose,
+        )
+        return client.poll_mail_for_code(
+            target_email=target_email,
+            jwt=tempmail_jwt,
+            sender_filters=sender_filters,
+            keyword="openai",
+            timeout=timeout,
+        )
+
+    if provider == "mailmanage":
+        from mailmanage_client import MailManageClient
+
+        client = MailManageClient(
+            api_key=mailmanage_api_key,
+            base_url=mailmanage_base_url,
+            verbose=verbose,
+        )
+        result = client.get_code(
+            target_email,
+            keyword=mailmanage_keyword or "gpt",
+            timeout=timeout,
+        )
+        return (result or {}).get("code")
+
+    from icloud_hme import ICloudHME
+
+    icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
+    return icloud.poll_mail_for_code(
+        target_email=target_email,
+        sender_filters=sender_filters,
+        timeout=timeout,
+        imap_user=imap_user,
+        imap_password=imap_password,
+    )
+
+
 # ============================================================
 # Sentinel PoW (简化版，内联用)
 # ============================================================
@@ -494,6 +556,13 @@ def run_second_half(
     bind_code: str = "",
     imap_user: str = "",
     imap_password: str = "",
+    email_provider: str = "icloud",
+    tempmail_base_url: str = "",
+    tempmail_jwt: str = "",
+    tempmail_site_password: str = "",
+    mailmanage_api_key: str = "",
+    mailmanage_base_url: str = "",
+    mailmanage_keyword: str = "gpt",
     sub2api_session_id: str = "",
     sub2api_state: str = "",
 ) -> Dict:
@@ -616,14 +685,20 @@ def run_second_half(
             code_bind = bind_code
             if not code_bind:
                 log("[7] iCloud 收验证码 ...")
-                from icloud_hme import ICloudHME
-                icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
-                code_bind = icloud.poll_mail_for_code(
+                code_bind = _poll_email_code(
+                    provider=email_provider,
                     target_email=icloud_email,
-                    sender_filters=["openai", "noreply", "verification", "no-reply"],
-                    timeout=60,
+                    icloud_cookies=icloud_cookies,
+                    verbose=verbose,
                     imap_user=imap_user,
                     imap_password=imap_password,
+                    tempmail_base_url=tempmail_base_url,
+                    tempmail_jwt=tempmail_jwt,
+                    tempmail_site_password=tempmail_site_password,
+                    mailmanage_api_key=mailmanage_api_key,
+                    mailmanage_base_url=mailmanage_base_url,
+                    mailmanage_keyword=mailmanage_keyword,
+                    timeout=60,
                 )
                 if not code_bind:
                     print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")
@@ -669,14 +744,20 @@ def run_second_half(
                 code_bind = bind_code
                 log(f"[7] 使用手动验证码: {code_bind}")
             else:
-                from icloud_hme import ICloudHME
-                icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
-                code_bind = icloud.poll_mail_for_code(
+                code_bind = _poll_email_code(
+                    provider=email_provider,
                     target_email=icloud_email,
-                    sender_filters=["openai", "noreply", "verification", "no-reply"],
-                    timeout=60,
+                    icloud_cookies=icloud_cookies,
+                    verbose=verbose,
                     imap_user=imap_user,
                     imap_password=imap_password,
+                    tempmail_base_url=tempmail_base_url,
+                    tempmail_jwt=tempmail_jwt,
+                    tempmail_site_password=tempmail_site_password,
+                    mailmanage_api_key=mailmanage_api_key,
+                    mailmanage_base_url=mailmanage_base_url,
+                    mailmanage_keyword=mailmanage_keyword,
+                    timeout=60,
                 )
                 if not code_bind:
                     print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")
