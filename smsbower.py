@@ -1,4 +1,4 @@
-"""
+﻿"""
 SMSBower API client for automated SMS verification code retrieval.
 API docs: https://smsbower.app/api?page=client
 """
@@ -10,6 +10,19 @@ import requests
 
 
 SMSBOWER_API = "https://smsbower.page/stubs/handler_api.php"
+COUNTRY_ALIASES = {
+    "indonesia": "6",
+    "印度尼西亚": "6",
+    "印尼": "6",
+}
+
+
+def normalize_service(service: str) -> str:
+    """Normalize legacy/local service aliases to SMSBower API service codes."""
+    code = str(service or "").strip().lower()
+    if code in ("", "openai"):
+        return "dr"
+    return code
 
 
 def _call(api_key: str, params: dict) -> str:
@@ -45,6 +58,55 @@ class SmsBower:
         )
         return r.json().get("services", [])
 
+    def list_countries(self) -> list[dict]:
+        r = requests.get(
+            SMSBOWER_API,
+            params={"api_key": self.api_key, "action": "getCountries"},
+            timeout=15,
+        )
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if isinstance(data.get("countries"), list):
+                return data["countries"]
+            rows = []
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    row = dict(value)
+                    row.setdefault("id", key)
+                else:
+                    row = {"id": key, "name": str(value)}
+                rows.append(row)
+            return rows
+        return []
+
+    def top_countries_by_service(self, service: str) -> dict:
+        service = normalize_service(service)
+        r = requests.get(
+            SMSBOWER_API,
+            params={
+                "api_key": self.api_key,
+                "action": "getTopCountriesByService",
+                "service": service,
+            },
+            timeout=15,
+        )
+        data = r.json()
+        if isinstance(data, dict):
+            for key in ("countries", "data", "result"):
+                if isinstance(data.get(key), dict):
+                    return data[key]
+                if isinstance(data.get(key), list):
+                    rows = {}
+                    for row in data[key]:
+                        if isinstance(row, dict):
+                            cid = row.get("id") or row.get("code") or row.get("country") or row.get("name")
+                            if cid is not None:
+                                rows[str(cid)] = row
+                    return rows
+        return data if isinstance(data, dict) else {}
+
     def find_service(self, keyword: str) -> list[dict]:
         services = self.list_services()
         kw = keyword.lower()
@@ -54,9 +116,33 @@ class SmsBower:
             or kw in s.get("name", "").lower()
         ]
 
+    def resolve_country_id(self, country: str) -> str:
+        raw = str(country or "").strip()
+        if not raw:
+            return raw
+        if raw.isdigit():
+            return raw
+        needle = raw.lower()
+        if needle in COUNTRY_ALIASES:
+            return COUNTRY_ALIASES[needle]
+        for item in self.list_countries():
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or item.get("code") or item.get("country") or "").strip()
+            aliases = [
+                str(item.get(k) or "").strip().lower()
+                for k in ("name", "eng", "chn", "rus", "title")
+            ]
+            aliases.append(cid.lower())
+            if needle in aliases and cid:
+                return cid
+        return raw
+
     def get_cheapest_provider(
-        self, service: str = "dr", country: str = "151"
+        self, service: str = "openai", country: str = "151"
     ) -> tuple[str, float]:
+        service = normalize_service(service)
+        country = self.resolve_country_id(country)
         r = requests.get(
             SMSBOWER_API,
             params={
@@ -79,14 +165,19 @@ class SmsBower:
 
     def get_number(
         self,
-        service: str = "dr",
+        service: str = "openai",
         country: str = "151",
         provider_ids: str = "",
+        min_price: str = "",
         max_price: str = "",
     ) -> tuple[str, str]:
+        service = normalize_service(service)
+        country = self.resolve_country_id(country)
         params = {"action": "getNumber", "service": service, "country": country}
         if provider_ids:
             params["providerIds"] = provider_ids
+        if min_price:
+            params["minPrice"] = min_price
         if max_price:
             params["maxPrice"] = max_price
         resp = _call(self.api_key, params)

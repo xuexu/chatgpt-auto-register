@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """ChatGPT Auto Register - Web GUI (Open Source Edition)"""
 
 import copy, json, os, queue, sys, threading, time
@@ -60,8 +60,8 @@ def _load_config():
             saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             cfg = _state["config"]
             # 合并所有顶层简单字段
-            for k in ("proxy", "country", "service", "max_price", "sms_timeout",
-                      "code_timeout", "bind_email", "email_provider"):
+            for k in ("proxy", "country", "service", "min_price", "max_price", "sms_timeout",
+                      "code_timeout", "max_attempts", "bind_email", "email_provider"):
                 if k in saved:
                     cfg[k] = saved[k]
             # 合并嵌套对象
@@ -81,10 +81,12 @@ _state = {
         "register": {"password": ""},
         "proxy": "",
         "country": "151",
-        "service": "dr",
+        "service": "openai",
+        "min_price": "",
         "max_price": "",
         "sms_timeout": 30,
         "code_timeout": 30,
+        "max_attempts": 15,
         "icloud": {"user": "", "pass": ""},
         "email_provider": "icloud",
         "tempmail": {"base_url": "", "admin_auth": "", "domain": "", "site_password": ""},
@@ -124,7 +126,7 @@ def api_config():
     if request.method == "POST":
         d = request.json or {}
         cfg = _state["config"]
-        for k in ["api_key", "proxy", "country", "max_price", "sms_timeout",
+        for k in ["api_key", "proxy", "country", "service", "min_price", "max_price", "sms_timeout", "max_attempts",
                    "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
                    "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email",
                    "email_provider", "tempmail_base_url", "tempmail_admin_auth",
@@ -132,8 +134,12 @@ def api_config():
             if k in d and d[k] is not None:
                 if k == "api_key": cfg["smsbower"]["api_key"] = d[k]
                 elif k == "password": cfg["register"]["password"] = d[k]
-                elif k in ("sms_timeout",): cfg[k] = int(d[k]) if d[k] else 30
-                elif k in ("proxy", "country", "max_price"): cfg[k] = d[k]
+                elif k in ("sms_timeout",):
+                    cfg[k] = int(d[k]) if d[k] else 30
+                    cfg["code_timeout"] = cfg[k]
+                elif k in ("max_attempts",): cfg[k] = int(d[k]) if d[k] else 15
+                elif k in ("proxy", "country", "min_price", "max_price"): cfg[k] = d[k]
+                elif k == "service": cfg[k] = "openai" if d[k] == "dr" else d[k]
                 elif k == "email_provider": cfg["email_provider"] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
@@ -162,6 +168,129 @@ def api_balance():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@app.route("/api/smsbower/services")
+def api_smsbower_services():
+    key = _state.get("config", {}).get("smsbower", {}).get("api_key", "")
+    if not key:
+        return jsonify({"ok": False, "error": "No API key"})
+    try:
+        services = SmsBower(key).list_services()
+        return jsonify({"ok": True, "services": services})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+def _country_id(country: dict) -> str:
+    for key in ("id", "code", "country", "country_id"):
+        val = country.get(key)
+        if val is not None and str(val):
+            return str(val)
+    return ""
+
+
+def _country_name(country: dict) -> str:
+    for key in ("chn", "name", "eng", "rus", "title"):
+        val = country.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def _country_lookup_key(country: dict) -> str:
+    return _country_name(country).strip().lower()
+
+
+def _country_aliases(country: dict) -> list[str]:
+    aliases = []
+    for key in ("id", "code", "country", "chn", "name", "eng", "rus", "title"):
+        val = country.get(key)
+        if val:
+            aliases.append(str(val).strip().lower())
+    return aliases
+
+
+def _provider_stats(meta) -> tuple[str, str]:
+    if not isinstance(meta, dict):
+        return "", ""
+    count = meta.get("count") or meta.get("qty") or meta.get("amount") or meta.get("total") or ""
+    price = meta.get("price") or meta.get("minPrice") or meta.get("min_price") or meta.get("cost") or ""
+    if count or price:
+        return str(count), str(price)
+
+    total = 0
+    prices = []
+    for info in meta.values():
+        if not isinstance(info, dict):
+            continue
+        raw_count = info.get("count") or info.get("qty") or info.get("amount") or info.get("total")
+        try:
+            total += int(float(raw_count))
+        except Exception:
+            pass
+        raw_price = info.get("price") or info.get("minPrice") or info.get("min_price") or info.get("cost")
+        try:
+            prices.append(float(raw_price))
+        except Exception:
+            pass
+    return (str(total) if total else "", str(min(prices)) if prices else "")
+
+
+@app.route("/api/smsbower/countries")
+def api_smsbower_countries():
+    key = _state.get("config", {}).get("smsbower", {}).get("api_key", "")
+    service = (request.args.get("service") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "No API key"})
+    if not service:
+        return jsonify({"ok": False, "error": "Service required"})
+    try:
+        sms = SmsBower(key)
+        countries = sms.list_countries()
+        top = sms.top_countries_by_service(service)
+        country_map = {_country_id(c): c for c in countries if isinstance(c, dict) and _country_id(c)}
+        country_name_map = {}
+        for c in countries:
+            if not isinstance(c, dict):
+                continue
+            for alias in _country_aliases(c):
+                country_name_map[alias] = c
+        available_ids = {str(k): v for k, v in top.items()} if isinstance(top, dict) else {}
+        rows = []
+        top_by_id = {}
+        top_by_name = {}
+        for raw_cid, meta in available_ids.items():
+            raw_key = str(raw_cid).strip()
+            count, price = _provider_stats(meta)
+            top_by_id[raw_key] = (count, price)
+            top_by_name[raw_key.lower()] = (count, price)
+
+        for c in countries:
+            if not isinstance(c, dict):
+                continue
+            cid = _country_id(c)
+            if not cid:
+                continue
+            row = dict(c)
+            row["id"] = cid
+            row["name"] = _country_name(row) or cid
+            stats = top_by_id.get(cid)
+            if not stats:
+                for alias in _country_aliases(row):
+                    stats = top_by_name.get(alias)
+                    if stats:
+                        break
+            if stats:
+                row["count"], row["price"] = stats
+            else:
+                row["count"] = row.get("count", "")
+                row["price"] = row.get("price", "")
+            rows.append(row)
+        rows.sort(key=lambda r: str(r.get("name", "")).lower())
+        return jsonify({"ok": True, "countries": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
     w = _state.get("worker")
@@ -171,12 +300,13 @@ def api_start():
     d = request.json or {}
     count = int(d.get("count", 1))
     retries = int(d.get("retries", 2))
+    max_attempts = int(d.get("max_attempts", 0) or 0)
     cfg = _state["config"]
     _state["results"] = []
 
     stop_ev = threading.Event()
     thr = threading.Thread(
-        target=_run, args=(cfg, count, retries, stop_ev), daemon=True
+        target=_run, args=(cfg, count, retries, max_attempts, stop_ev), daemon=True
     )
     _state["worker"] = {"thread": thr, "stop": stop_ev, "status": "启动中", "phone": "", "progress": ""}
     thr.start()
@@ -304,8 +434,9 @@ def _mark_tempmail_used(cfg: dict, email: str):
     ).mark_used(email)
 
 
-def _run(config, count, retries, stop_event):
+def _run(config, count, retries, max_attempts, stop_event):
     cfg = dict(config)  # copy
+    cfg["code_timeout"] = int(cfg.get("sms_timeout") or cfg.get("code_timeout") or 30)
     wid = 1
     _log(f"Worker 启动 (proxy={cfg.get('proxy','直连')})", "info", wid)
 
@@ -323,7 +454,7 @@ def _run(config, count, retries, stop_event):
 
     ok_count = 0
     attempt = 0
-    max_attempts = count * 15
+    max_attempts = max_attempts if max_attempts > 0 else count * int(cfg.get("max_attempts", 15) or 15)
     RESULTS_DIR.mkdir(exist_ok=True)
     _log(f"开始: 目标{count}个  重试{retries}次/步", "success", wid)
 
@@ -384,6 +515,7 @@ def _run(config, count, retries, stop_event):
             with contextlib.redirect_stdout(_WorkerLogIO()):
                 result = ar.register_one(sms, cfg, verbose=True, step_retries=retries,
                                          create_account_max_retries=20,
+                                         min_price=cfg.get("min_price", ""),
                                          max_price=cfg.get("max_price", ""))
         except Exception as e:
             result = {"ok": False, "phone": "?", "error": str(e)}
@@ -655,6 +787,10 @@ label{display:block;font-size:11px;margin:6px 0 2px;color:#8b6f4e}
 input,select,textarea{width:100%;padding:6px 8px;background:#fffbf5;border:1px solid #d4b896;border-radius:4px;color:#5c4b3b;font-size:13px}
 input:focus,select:focus,textarea:focus{outline:none;border-color:#c4820e;box-shadow:0 0 0 2px rgba(196,130,14,.15)}
 textarea{resize:vertical;font-family:Consolas,'Microsoft YaHei',monospace;font-size:11px}
+.input-row{display:flex;gap:6px;align-items:center}
+.input-row input{flex:1}
+.input-row button{white-space:nowrap;margin:0;padding:6px 10px}
+.mini-select{margin-top:4px;display:block}
 button{padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px;margin:4px 2px;transition:all .15s}
 button:disabled{opacity:.5;cursor:not-allowed}
 .btn-start{background:#c4820e;color:#fff}.btn-start:hover:not(:disabled){background:#a86e0c}
@@ -682,8 +818,23 @@ hr{border-color:#e0cda7;margin:8px 0}
   <label>代理</label>
   <input id="proxy" placeholder="socks5h://127.0.0.1:10808">
 
+  <label>SMSBower 服务</label>
+  <div class="input-row">
+    <input id="service" value="openai" list="service_list" placeholder="openai">
+    <button class="btn-neutral" onclick="loadServices()">获取服务</button>
+  </div>
+  <datalist id="service_list"></datalist>
+
   <label>国家代码</label>
-  <input id="country" value="151">
+  <div class="input-row">
+    <input id="country" value="151" list="country_list" placeholder="输入或选择国家代码">
+    <button class="btn-neutral" onclick="loadCountries()">获取国家列表</button>
+  </div>
+  <datalist id="country_list"></datalist>
+  <select id="country_select" class="mini-select" onchange="selectCountry()"></select>
+
+  <label>最低价格 (空=不限)</label>
+  <input id="min_price" placeholder="0.089">
 
   <label>最高价格 (空=不限)</label>
   <input id="max_price" placeholder="0.039">
@@ -699,6 +850,9 @@ hr{border-color:#e0cda7;margin:8px 0}
 
   <label>步骤重试</label>
   <input id="retries" value="2" type="number" min="0" max="10">
+
+  <label>最大重试次数</label>
+  <input id="max_attempts" value="15" type="number" min="1" max="999">
 
   <details style="margin-top:10px">
     <summary>iCloud 邮箱 &amp; SUB2API</summary>
@@ -778,7 +932,7 @@ hr{border-color:#e0cda7;margin:8px 0}
 function G(id){return document.getElementById(id);}
 function toast(msg,ok){var t=G('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err')+' show';setTimeout(function(){t.className='toast'},2500);}
 
-var logEl=G('log'),logCursor=0;
+var logEl=G('log'),logCursor=0,allCountries=[];
 
 function pollLog(){
   fetch('/api/log-since/'+logCursor).then(function(r){return r.json()}).then(function(d){
@@ -798,8 +952,9 @@ function pollLog(){
 setInterval(pollLog,800);
 
 function saveConfig(){
-  var d={api_key:G('api_key').value,proxy:G('proxy').value,country:G('country').value,
-    password:G('password').value,max_price:G('max_price').value,
+  var d={api_key:G('api_key').value,proxy:G('proxy').value,country:countryCode(),
+    service:serviceCode(),password:G('password').value,
+    min_price:G('min_price').value,max_price:G('max_price').value,
     sms_timeout:G('sms_timeout').value,
     imap_user:G('imap_user').value,imap_pass:G('imap_pass').value,
     sub2api_url:G('sub2api_url').value,sub2api_email:G('sub2api_email').value,
@@ -811,6 +966,109 @@ function saveConfig(){
     tempmail_site_password:G('tempmail_site_password').value};
   return fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
     .then(function(r){return r.json()}).then(function(j){toast('配置已保存',j.ok);return j;});
+}
+
+function serviceCode(){
+  var v=(G('service').value||'').trim();
+  var m=v.match(/\(([^()]+)\)\s*$/);
+  var code=(m?m[1]:v)||'openai';
+  return code==='dr'?'openai':code;
+}
+
+function countryCode(){
+  var v=(G('country').value||'').trim();
+  var m=v.match(/\(([^()]+)\)\s*$/);
+  var raw=(m?m[1]:v)||'151';
+  var needle=raw.toLowerCase();
+  for(var i=0;i<(allCountries||[]).length;i++){
+    var c=allCountries[i]||{};
+    var id=String(c.id||c.code||c.country||'');
+    var aliases=[id,String(c.name||''),String(c.chn||''),String(c.eng||''),String(c.rus||''),String(c.title||'')];
+    for(var j=0;j<aliases.length;j++){
+      if(aliases[j] && aliases[j].toLowerCase()===needle)return id||raw;
+    }
+  }
+  return raw;
+}
+
+function loadServices(){
+  if(!G('api_key').value.trim()){toast('请先填写 SMSBower Key',false);return}
+  saveConfig().then(function(){
+  fetch('/api/smsbower/services').then(function(r){return r.json()}).then(function(j){
+    if(!j.ok){toast('获取服务失败: '+j.error,false);return}
+    var dl=G('service_list');dl.innerHTML='';
+    (j.services||[]).forEach(function(s){
+      var code=s.code||s.service||s.id||'';
+      if(!code)return;
+      var name=s.name||s.title||code;
+      var opt=document.createElement('option');
+      opt.value=code;
+      opt.label=name+' ('+code+')';
+      dl.appendChild(opt);
+    });
+    toast('服务列表已加载',true);
+  }).catch(function(){toast('获取服务失败',false);});
+  });
+}
+
+function loadCountries(){
+  var service=serviceCode();
+  if(!service){toast('请先选择 SMSBower 服务',false);return}
+  saveConfig().then(function(){
+  fetch('/api/smsbower/countries?service='+encodeURIComponent(service)).then(function(r){return r.json()}).then(function(j){
+    if(!j.ok){toast('获取国家失败: '+j.error,false);return}
+    allCountries=j.countries||[];
+    renderCountries('');
+    G('country_select').focus();
+    toast('国家列表已加载: '+allCountries.length+' 个',true);
+  }).catch(function(){toast('获取国家失败',false);});
+  });
+}
+
+function countryText(c){
+  var id=c.id||c.code||c.country||'';
+  var name=c.name||c.chn||c.eng||c.rus||id;
+  var bits=[name+' ('+id+')'];
+  if(c.count)bits.push('数量 '+c.count);
+  if(c.price)bits.push('最低 $'+c.price);
+  return bits.join(' | ');
+}
+
+function renderCountries(filterText){
+  var filter=(filterText||'').trim().toLowerCase();
+  var dl=G('country_list');dl.innerHTML='';
+  var sel=G('country_select');sel.innerHTML='';
+  var blank=document.createElement('option');
+  blank.value='';
+  blank.textContent='选择国家...';
+  sel.appendChild(blank);
+  var shown=0;
+  (allCountries||[]).forEach(function(c){
+      var id=c.id||c.code||c.country||'';
+      if(!id)return;
+      var text=countryText(c);
+      if(filter && text.toLowerCase().indexOf(filter)<0 && String(id).indexOf(filter)<0)return;
+      var opt=document.createElement('option');
+      opt.value=id;
+      opt.label=text;
+      dl.appendChild(opt);
+      var so=document.createElement('option');
+      so.value=id;
+      so.textContent=text;
+      sel.appendChild(so);
+      shown++;
+    });
+  sel.style.display='block';
+}
+
+function selectCountry(){
+  var v=G('country_select').value;
+  if(v)G('country').value=v;
+}
+
+function bindCountryFilter(){
+  var el=G('country');
+  if(el)el.addEventListener('input', function(){ if(allCountries.length)renderCountries(el.value); });
 }
 
 function checkBalance(){
@@ -826,7 +1084,7 @@ function startReg(){
   saveConfig().then(function(){
     G('btn-start').disabled=true;G('btn-stop').disabled=false;G('worker-status').innerHTML='<span class=spin></span>运行中';
     G('ok-count').textContent='0';G('fail-count').textContent='0';
-    var d={count:parseInt(G('count').value)||1,retries:parseInt(G('retries').value)||2};
+    var d={count:parseInt(G('count').value)||1,retries:parseInt(G('retries').value)||2,max_attempts:parseInt(G('max_attempts').value)||15};
     fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
       .then(function(r){return r.json()}).then(function(j){if(!j.ok)toast(j.error,false);});
   });
@@ -894,9 +1152,12 @@ function loadConfig(){
     var c=j.config;
     if(c.smsbower) G('api_key').value=c.smsbower.api_key||'';
     G('proxy').value=c.proxy||'';
+    G('service').value=(c.service==='dr'?'openai':(c.service||'openai'));
     G('country').value=c.country||'151';
+    G('min_price').value=c.min_price||'';
     G('max_price').value=c.max_price||'';
     G('sms_timeout').value=c.sms_timeout||'30';
+    G('max_attempts').value=c.max_attempts||'15';
     if(c.register) G('password').value=c.register.password||'';
     if(c.icloud){
       G('imap_user').value=c.icloud.user||'';
@@ -921,6 +1182,7 @@ function loadConfig(){
 
 loadConfig();
 loadCookiesStatus();
+bindCountryFilter();
 </script></body></html>"""
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 ChatGPT Auto Register - Fully automated phone-based registration.
 
@@ -78,7 +78,7 @@ def load_config(path: str = None) -> dict:
         "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
         "proxy": "",
         "country": "151",
-        "service": "dr",
+        "service": "openai",
         "code_timeout": 30,
     }
     candidates = [path, "config.json", str(Path(__file__).parent / "config.json")]
@@ -90,14 +90,16 @@ def load_config(path: str = None) -> dict:
             for k in ["smsbower", "register"]:
                 if k in found:
                     config[k].update(found[k])
-            for k in ["proxy", "country", "service", "code_timeout"]:
+            for k in ["proxy", "country", "service", "code_timeout", "sms_timeout"]:
                 if k in found:
                     config[k] = found[k]
             # Passthrough extra keys (e.g. "gui")
             for k, v in found.items():
-                if k not in {"smsbower", "register", "proxy", "country", "service", "code_timeout"}:
+                if k not in {"smsbower", "register", "proxy", "country", "service", "code_timeout", "sms_timeout"}:
                     config[k] = v
             break
+    if "sms_timeout" in config:
+        config["code_timeout"] = int(config.get("sms_timeout") or config.get("code_timeout") or 30)
     if os.environ.get("SMSBOWER_KEY"):
         config["smsbower"]["api_key"] = os.environ["SMSBOWER_KEY"]
     proxy_env = os.environ.get("PROXY") or os.environ.get("HTTPS_PROXY")
@@ -113,6 +115,7 @@ def register_one(
     sms: SmsBower,
     config: dict,
     provider_ids: str = "",
+    min_price: str = "",
     max_price: str = "",
     verbose: bool = True,
     step_retries: int = 2,
@@ -135,7 +138,13 @@ def register_one(
     sr = step_retries
 
     try:
-        aid, phone_raw = sms.get_number(service=service, country=country, provider_ids=provider_ids, max_price=max_price)
+        aid, phone_raw = sms.get_number(
+            service=service,
+            country=country,
+            provider_ids=provider_ids,
+            min_price=min_price,
+            max_price=max_price,
+        )
         phone = "+" + phone_raw if not phone_raw.startswith("+") else phone_raw
         if verbose:
             print(f"  手机号: {phone}  激活ID: {aid}")
@@ -158,10 +167,18 @@ def register_one(
         if verbose:
             print(f"  验证码已发送到 {phone}")
 
-        code = sms.wait_code(timeout=config["code_timeout"])
+        code_timeout = int(config.get("code_timeout") or config.get("sms_timeout") or 30)
+        code = sms.wait_code(timeout=code_timeout)
         if not code:
-            sms.cancel()
-            return {"ok": False, "phone": phone, "error": "验证码超时"}
+            if verbose:
+                print(f"  验证码超时，重发一次到 {phone}")
+            _retry_call(lambda: reg.send_otp(continue_url), sr, label="重发验证码")
+            if verbose:
+                print(f"  验证码已重新发送到 {phone}")
+            code = sms.wait_code(timeout=code_timeout)
+            if not code:
+                sms.cancel()
+                return {"ok": False, "phone": phone, "error": "验证码超时"}
 
         if verbose:
             print(f"  收到验证码: {code}")
@@ -229,8 +246,9 @@ def main():
     parser.add_argument("--config", "-c", type=str, help="配置文件路径")
     parser.add_argument("--count", "-n", type=int, default=1, help="目标成功数量")
     parser.add_argument("--country", type=str, help="国家 ID (默认 151=智利)")
-    parser.add_argument("--service", type=str, help="服务代码 (默认 dr=OpenAI)")
+    parser.add_argument("--service", type=str, help="服务代码 (默认 openai)")
     parser.add_argument("--provider", type=str, default="", help="指定运营商 ID")
+    parser.add_argument("--min-price", type=str, default="", help="最低价格")
     parser.add_argument("--max-price", type=str, default="", help="最高价格")
     parser.add_argument("--proxy", type=str, help="代理地址")
     parser.add_argument("--password", type=str, help="密码 (留空随机)")
@@ -285,7 +303,7 @@ def main():
         print(f"\n第 {attempt} 次 [{ok_count}/{args.count}]")
         try:
             result = register_one(sms, config, provider_ids=args.provider,
-                                  max_price=args.max_price, step_retries=args.retry,
+                                  min_price=args.min_price, max_price=args.max_price, step_retries=args.retry,
                                   create_account_max_retries=args.create_retry,
                                   verbose=True)
         except Exception as e:

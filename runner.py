@@ -1,4 +1,4 @@
-"""Registration engine - thread-safe, multi-user, with SSE streaming"""
+﻿"""Registration engine - thread-safe, multi-user, with SSE streaming"""
 
 import json
 import threading
@@ -113,6 +113,8 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
     config_data = db.get_user_config(user_id)
     proxy = config_data.get("proxy", "") or "socks5h://127.0.0.1:10808"
     country = config_data.get("country", "") or "151"
+    service = config_data.get("service", "") or "openai"
+    min_price = config_data.get("min_price", "") or ""
     max_price = config_data.get("max_price", "") or ""
     sms_timeout = config_data.get("sms_timeout", 30) or 30
     smsbower_key = config_data.get("smsbower_key", "") or ""
@@ -123,7 +125,7 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
     sms = SmsBower(smsbower_key)
     reg_config = {
-        "service": "dr",
+        "service": service,
         "country": country,
         "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
         "proxy": proxy,
@@ -166,6 +168,7 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
             with contextlib.redirect_stdout(buf):
                 result = ar.register_one(
                     sms, reg_config, verbose=True, step_retries=2, max_price=max_price,
+                    min_price=min_price,
                 )
             for line in buf.getvalue().split("\n"):
                 if line.strip():

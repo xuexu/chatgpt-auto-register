@@ -1,4 +1,4 @@
-{
+﻿{
     "smsbower": {
         "api_key": "YOUR_API_KEY"
     },
@@ -9,7 +9,7 @@
     },
     "proxy": "",
     "country": "151",
-    "service": "dr",
+    "service": "openai",
     "code_timeout": 30,
     "max_price": "",
 
