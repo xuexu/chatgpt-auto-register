@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 MailManage 邮箱管理平台 API 客户端
+https://mailmanage.lizaliza.top
 
 功能:
   - 按分类查询邮箱池 (GET /api/mailboxes)
@@ -17,7 +18,7 @@ from typing import Optional, Dict, List
 import requests
 
 
-DEFAULT_BASE_URL = os.environ.get("MAILMANAGE_BASE_URL", "")
+DEFAULT_BASE_URL = "https://mailmanage.lizaliza.top"
 DEFAULT_USED_FILE = str(Path(__file__).parent / "used_emails.json")
 
 

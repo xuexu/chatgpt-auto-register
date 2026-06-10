@@ -1,325 +1,382 @@
 #!/usr/bin/env python3
-"""Client for dreamhunter2333/cloudflare_temp_email deployments.
+"""cloudflare_temp_email Address JWT client."""
 
-The worker exposes two useful surfaces for this project:
-  - POST /admin/new_address: create an address and get its address JWT.
-  - GET /api/parsed_mails: poll parsed inbox entries with the address JWT.
-"""
+from __future__ import annotations
 
-import html
-import os
+import json
+import html as html_lib
+import random
 import re
-import secrets
 import string
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import requests
 
 
-DEFAULT_USED_FILE = os.path.join(os.path.dirname(__file__), "used_tempmails.json")
-DEFAULT_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "tempmail_tokens.json")
+DEFAULT_USED_FILE = str(Path(__file__).parent / "tempmail_used.json")
+CODE_RE = re.compile(r"(?<!\d)(\d{6,8})(?!\d)")
+STANDALONE_CODE_RE = re.compile(r"^\s*(\d{6,8})\s*$")
+STYLE_SCRIPT_RE = re.compile(r"<(style|script)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
+PHRASE_CODE_RE = re.compile(
+    r"(?:verification\s+code|temporary\s+code|security\s+code|验证码|驗證碼|代码|代碼)"
+    r"[\s\S]{0,120}?(?<!\d)(\d{6,8})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class TempMailAccount:
+    base_url: str
+    jwt: str
+    email: str = ""
+    site_password: str = ""
+
+
+def parse_tempmail_pool(pool: str, default_base_url: str = "", default_site_password: str = "") -> list[TempMailAccount]:
+    accounts: list[TempMailAccount] = []
+    for raw_line in str(pool or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("----")]
+        if len(parts) == 1:
+            base_url, email, jwt, site_password = default_base_url, "", parts[0], default_site_password
+        elif len(parts) == 2:
+            base_url, email, jwt, site_password = default_base_url, parts[0], parts[1], default_site_password
+        else:
+            base_url, email, jwt = parts[0], parts[1], parts[2]
+            site_password = parts[3] if len(parts) >= 4 else default_site_password
+        if base_url and jwt:
+            accounts.append(TempMailAccount(base_url=base_url.rstrip("/"), jwt=jwt, email=email, site_password=site_password))
+    return accounts
+
+
+def html_to_visible_text(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = STYLE_SCRIPT_RE.sub(" ", text)
+    text = HTML_COMMENT_RE.sub(" ", text)
+    text = re.sub(r"</(p|div|tr|td|th|table|br|h[1-6]|li)>", "\n", text, flags=re.IGNORECASE)
+    text = TAG_RE.sub(" ", text)
+    text = html_lib.unescape(text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_verification_code(row: dict) -> str:
+    """Prefer visible OpenAI OTP text over arbitrary CSS/HTML numbers."""
+    direct_fields = ("code", "otp", "verification_code", "verificationCode")
+    for key in direct_fields:
+        value = str(row.get(key) or "").strip()
+        match = STANDALONE_CODE_RE.match(value)
+        if match:
+            return match.group(1)
+
+    subject = str(row.get("subject") or "")
+    sender = str(row.get("sender") or row.get("source") or "")
+    text_body = str(row.get("text") or "")
+    html_body = str(row.get("html") or "")
+    visible_parts = [html_to_visible_text(html_body), html_to_visible_text(text_body)]
+    visible = "\n".join(part for part in visible_parts if part)
+
+    is_openai_mail = any(
+        marker in f"{sender}\n{subject}\n{visible[:1000]}".lower()
+        for marker in ("openai", "verification code", "temporary code", "验证码", "驗證碼")
+    )
+
+    if is_openai_mail:
+        for line in visible.splitlines():
+            match = STANDALONE_CODE_RE.match(line)
+            if match:
+                return match.group(1)
+
+    for source in (visible, f"{subject}\n{visible}", f"{subject}\n{text_body}\n{html_body}"):
+        match = PHRASE_CODE_RE.search(source)
+        if match:
+            return match.group(1)
+
+    haystack = "\n".join(str(row.get(k) or "") for k in ("sender", "source", "subject", "text", "html"))
+    match = CODE_RE.search(haystack)
+    return match.group(1) if match else ""
 
 
 class TempMailClient:
-    """Cloudflare Temp Email API client."""
-
     def __init__(
         self,
         base_url: str,
-        admin_auth: str = "",
-        domain: str = "",
+        jwt: str = "",
         site_password: str = "",
+        admin_password: str = "",
+        domain: str = "",
+        name_prefix: str = "gpt",
+        pool: str = "",
         used_file: str = DEFAULT_USED_FILE,
-        token_file: str = DEFAULT_TOKEN_FILE,
         verbose: bool = False,
     ):
-        if not base_url:
-            raise ValueError("tempmail base_url is required")
-        self.base_url = base_url.rstrip("/")
-        self.admin_auth = admin_auth
-        self.domain = domain
-        self.site_password = site_password
+        self.base_url = (base_url or "").rstrip("/")
+        self.jwt = (jwt or "").strip()
+        self.site_password = site_password or ""
+        self.admin_password = admin_password or ""
+        self.domain = (domain or "").strip()
+        self.name_prefix = (name_prefix or "gpt").strip() or "gpt"
+        self.pool = pool or ""
         self.used_file = used_file
-        self.token_file = token_file
         self.verbose = verbose
-        self._tokens: Dict[str, str] = self._load_tokens()
         self._used = self._load_used()
-        self.last_created: Dict[str, str] = {}
 
     def _log(self, msg: str):
         if self.verbose:
             print(f"  [TempMail] {msg}")
 
-    def _load_used(self) -> set:
-        if not os.path.isfile(self.used_file):
+    def _load_used(self) -> set[str]:
+        path = Path(self.used_file)
+        if not path.exists():
             return set()
         try:
-            import json
-
-            with open(self.used_file, "r", encoding="utf-8") as f:
-                return set(json.load(f).get("used", []))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return set(str(x).lower() for x in data.get("used", []))
         except Exception:
             return set()
 
     def _save_used(self):
-        import json
-
-        with open(self.used_file, "w", encoding="utf-8") as f:
-            json.dump({"used": sorted(self._used)}, f, indent=2, ensure_ascii=False)
-
-    def _load_tokens(self) -> Dict[str, str]:
-        if not os.path.isfile(self.token_file):
-            return {}
-        try:
-            import json
-
-            with open(self.token_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {str(k).lower(): str(v) for k, v in (data.get("tokens") or {}).items()}
-        except Exception:
-            return {}
-
-    def _save_tokens(self):
-        import json
-
-        with open(self.token_file, "w", encoding="utf-8") as f:
-            json.dump({"tokens": self._tokens}, f, indent=2, ensure_ascii=False)
-
-    @staticmethod
-    def random_name(length: int = 10) -> str:
-        chars = string.ascii_lowercase + string.digits
-        return "".join(secrets.choice(chars) for _ in range(length))
-
-    def _admin_headers(self) -> Dict[str, str]:
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.admin_auth:
-            headers["x-admin-auth"] = self.admin_auth
-        if self.site_password:
-            headers["x-custom-auth"] = self.site_password
-        return headers
-
-    def _address_headers(self, jwt: str) -> Dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/json",
-            "x-lang": "en",
-        }
-        if self.site_password:
-            headers["x-custom-auth"] = self.site_password
-        return headers
-
-    @staticmethod
-    def _json_or_text(resp: requests.Response) -> Any:
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text
-
-    @staticmethod
-    def _unwrap_payload(data: Any) -> Dict:
-        if isinstance(data, dict) and isinstance(data.get("data"), dict):
-            return data["data"]
-        return data if isinstance(data, dict) else {}
-
-    @staticmethod
-    def _extract_address_data(data: Any) -> Dict[str, str]:
-        payload = TempMailClient._unwrap_payload(data)
-        email = (
-            payload.get("address")
-            or payload.get("email")
-            or payload.get("name")
-            or ""
+        Path(self.used_file).write_text(
+            json.dumps({"used": sorted(self._used)}, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
         )
-        jwt = payload.get("jwt") or payload.get("token") or payload.get("address_jwt") or ""
-        address_id = payload.get("address_id") or payload.get("id") or ""
-        password = payload.get("password") or ""
-        return {
-            "email": str(email),
-            "jwt": str(jwt),
-            "address_id": str(address_id),
-            "password": str(password),
-        }
-
-    def create_address(
-        self,
-        name: str = "",
-        domain: str = "",
-        enable_prefix: bool = False,
-        enable_random_subdomain: bool = False,
-        retries: int = 5,
-    ) -> Dict[str, str]:
-        """Create a mailbox via admin API.
-
-        Returns {"email": ..., "jwt": ..., "address_id": ...}.
-        """
-        last_error = ""
-        endpoint = "/admin/new_address" if self.admin_auth else "/api/new_address"
-        for i in range(max(1, retries)):
-            local = name or self.random_name()
-            payload = {
-                "name": local,
-                "domain": domain or self.domain,
-                "enablePrefix": bool(enable_prefix),
-            }
-            if enable_random_subdomain:
-                payload["enableRandomSubdomain"] = True
-
-            self._log(
-                f"creating address via {endpoint} name={local} "
-                f"domain={payload.get('domain') or '(auto)'}"
-            )
-            resp = requests.post(
-                f"{self.base_url}{endpoint}",
-                json=payload,
-                headers=self._admin_headers(),
-                timeout=30,
-            )
-            if resp.ok:
-                data = self._json_or_text(resp)
-                parsed = self._extract_address_data(data)
-                email = parsed["email"]
-                jwt = parsed["jwt"]
-                if email and jwt:
-                    self._tokens[email.lower()] = jwt
-                    self._save_tokens()
-                    self.last_created = parsed
-                    return parsed
-                last_error = f"unexpected response: {data}"
-            else:
-                last_error = resp.text[:300]
-
-            if name:
-                break
-            time.sleep(0.5 + i * 0.5)
-
-        raise RuntimeError(f"create tempmail address failed: {last_error}")
-
-    def get_available_email(self, **kwargs) -> str:
-        data = self.create_address(**kwargs)
-        email = data["email"]
-        if email.lower() in self._used:
-            self._log(f"created address was already marked used locally: {email}")
-        return email
 
     def mark_used(self, email: str):
-        email = email.strip().lower()
-        if email and email not in self._used:
-            self._used.add(email)
+        key = (email or "").strip().lower()
+        if key and key not in self._used:
+            self._used.add(key)
             self._save_used()
-            self._log(f"marked used: {email}")
+            self._log(f"标记已用: {email}")
 
-    def register_token(self, email: str, jwt: str):
-        if email and jwt:
-            self._tokens[email.strip().lower()] = jwt.strip()
-            self._save_tokens()
+    def _headers(self, account: TempMailAccount | None = None) -> dict:
+        account = account or TempMailAccount(self.base_url, self.jwt, site_password=self.site_password)
+        headers = {
+            "Authorization": f"Bearer {account.jwt}",
+            "Accept": "application/json",
+            "x-lang": "zh",
+        }
+        if account.site_password:
+            headers["x-custom-auth"] = account.site_password
+        return headers
 
-    def get_token(self, email: str, jwt: str = "") -> str:
-        token = jwt or self._tokens.get(email.strip().lower(), "")
-        if not token:
-            raise ValueError(f"missing address JWT for {email}")
-        return token
+    def _create_headers(self, admin: bool = False) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-lang": "zh",
+        }
+        if self.site_password:
+            headers["x-custom-auth"] = self.site_password
+        if admin and self.admin_password:
+            headers["x-admin-auth"] = self.admin_password
+        return headers
 
-    def list_parsed_mails(self, email: str, jwt: str = "", limit: int = 20, offset: int = 0) -> List[Dict]:
-        token = self.get_token(email, jwt)
+    def _get_json(self, account: TempMailAccount, path: str, params: dict | None = None) -> dict:
         resp = requests.get(
-            f"{self.base_url}/api/parsed_mails",
-            params={"limit": limit, "offset": offset},
-            headers=self._address_headers(token),
+            f"{account.base_url}{path}",
+            headers=self._headers(account),
+            params=params or {},
             timeout=30,
         )
+        if resp.status_code == 401:
+            raise RuntimeError("tempmail Address JWT 无效或已过期")
         if resp.status_code == 429:
-            raise RuntimeError("tempmail rate limited")
+            raise RuntimeError("tempmail 请求被限流")
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post_json(self, path: str, body: dict, admin: bool = False) -> dict:
+        if not self.base_url:
+            raise RuntimeError("tempmail API 地址未配置")
+        resp = requests.post(
+            f"{self.base_url}{path}",
+            headers=self._create_headers(admin=admin),
+            json=body,
+            timeout=30,
+        )
+        if resp.status_code in (401, 403):
+            raise RuntimeError(f"tempmail 创建邮箱认证失败: HTTP {resp.status_code} {resp.text[:200]}")
+        if resp.status_code == 429:
+            raise RuntimeError("tempmail 请求被限流")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            if not resp.ok:
+                raise RuntimeError(f"tempmail 请求失败: HTTP {resp.status_code} {resp.text[:200]}") from exc
+            raise RuntimeError(f"tempmail 返回非 JSON: {resp.text[:200]}") from exc
         if not resp.ok:
-            raise RuntimeError(f"list parsed mails failed: {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("results") or data.get("data") or data.get("mails") or []
-        return []
+            message = data.get("message") or data.get("error") or resp.text[:200]
+            raise RuntimeError(f"tempmail 请求失败: HTTP {resp.status_code} {message}")
+        return data
+
+    def _random_name(self) -> str:
+        suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        prefix = re.sub(r"[^a-zA-Z0-9._-]+", "", self.name_prefix)[:24] or "gpt"
+        return f"{prefix}{suffix}"
 
     @staticmethod
-    def extract_code(text: str, exclude_codes: Optional[List[str]] = None) -> Optional[str]:
-        exclude = {str(c) for c in (exclude_codes or []) if c}
-        for code in re.findall(r"(?<!\d)(\d{6})(?!\d)", text or ""):
-            if code not in exclude:
-                return code
+    def _account_from_create_response(base_url: str, site_password: str, data: dict) -> TempMailAccount:
+        jwt = str(data.get("jwt") or data.get("token") or data.get("address_jwt") or "").strip()
+        email = str(data.get("address") or data.get("email") or data.get("name") or "").strip()
+        if not jwt:
+            raise RuntimeError(f"tempmail 创建邮箱未返回 jwt: {data}")
+        if not email:
+            raise RuntimeError(f"tempmail 创建邮箱未返回 address: {data}")
+        return TempMailAccount(base_url=base_url, jwt=jwt, email=email, site_password=site_password)
+
+    def create_address(self, name: str = "", domain: str = "", enable_prefix: bool = True) -> TempMailAccount:
+        """Create one mailbox and return its Address JWT account."""
+        name = (name or "").strip() or self._random_name()
+        domain = (domain or "").strip() or self.domain
+
+        if self.admin_password:
+            body = {"enablePrefix": bool(enable_prefix), "name": name}
+            if domain:
+                body["domain"] = domain
+            data = self._post_json("/admin/new_address", body, admin=True)
+        else:
+            body = {"name": name}
+            if domain:
+                body["domain"] = domain
+            data = self._post_json("/api/new_address", body, admin=False)
+
+        account = self._account_from_create_response(self.base_url, self.site_password, data)
+        self._log(f"创建邮箱: {account.email}")
+        return account
+
+    def test_connection(self) -> dict:
+        """Verify tempmail connectivity. Prefer existing JWT/pool; otherwise create one mailbox."""
+        if not self.base_url:
+            raise RuntimeError("tempmail API 地址未配置")
+
+        accounts = parse_tempmail_pool(self.pool, self.base_url, self.site_password)
+        if not accounts and self.jwt:
+            accounts = [TempMailAccount(self.base_url, self.jwt, site_password=self.site_password)]
+        if accounts:
+            account = self._resolve_account(accounts[0])
+            return {"mode": "settings", "address": account.email, "base_url": account.base_url}
+
+        account = self.create_address()
+        return {"mode": "create_address", "address": account.email, "base_url": account.base_url}
+
+    def settings(self, account: TempMailAccount | None = None) -> dict:
+        account = account or TempMailAccount(self.base_url, self.jwt, site_password=self.site_password)
+        return self._get_json(account, "/api/settings")
+
+    def _resolve_account(self, account: TempMailAccount) -> TempMailAccount:
+        if account.email:
+            return account
+        data = self.settings(account)
+        email = str(data.get("address") or data.get("email") or "").strip()
+        if not email:
+            raise RuntimeError("tempmail /api/settings 未返回 address")
+        return TempMailAccount(
+            base_url=account.base_url,
+            jwt=account.jwt,
+            email=email,
+            site_password=account.site_password,
+        )
+
+    def get_available_email(self) -> Optional[str]:
+        account = self.reserve_account()
+        return account.email if account else None
+
+    def reserve_account(self) -> Optional[TempMailAccount]:
+        accounts = parse_tempmail_pool(self.pool, self.base_url, self.site_password)
+        if not accounts and self.base_url and self.jwt:
+            accounts = [TempMailAccount(self.base_url, self.jwt, site_password=self.site_password)]
+        for account in accounts:
+            resolved = self._resolve_account(account)
+            if resolved.email.lower() in self._used:
+                continue
+            self._log(f"选定邮箱: {resolved.email}")
+            return resolved
+        self._log("无可用邮箱")
         return None
 
-    def poll_mail_for_code(
+    def find_account_for_email(self, email: str) -> Optional[TempMailAccount]:
+        target = (email or "").strip().lower()
+        if not target:
+            return None
+        accounts = parse_tempmail_pool(self.pool, self.base_url, self.site_password)
+        if not accounts and self.base_url and self.jwt:
+            accounts = [TempMailAccount(self.base_url, self.jwt, site_password=self.site_password)]
+        for account in accounts:
+            resolved = self._resolve_account(account)
+            if resolved.email.lower() == target:
+                return resolved
+        return None
+
+    def poll_code(
         self,
-        target_email: str,
-        jwt: str = "",
-        sender_filters: Optional[List[str]] = None,
-        keyword: str = "",
+        email: str = "",
+        keyword: str = "openai",
         timeout: int = 60,
         interval: int = 5,
-        exclude_codes: Optional[List[str]] = None,
-    ) -> Optional[str]:
-        """Poll parsed mails and return the first 6-digit verification code."""
-        sender_filters = [s.lower() for s in (sender_filters or []) if s]
-        keyword = (keyword or "").lower()
-        seen_ids = set()
-        start = time.time()
-        self._log(f"polling {target_email} for code timeout={timeout}s")
+        start_after: float = 0.0,
+    ) -> str:
+        account = self.find_account_for_email(email) if email else self.reserve_account()
+        if not account:
+            raise RuntimeError(f"tempmail 未找到邮箱配置: {email}")
 
-        while time.time() - start < timeout:
+        seen_ids: set[str] = set()
+        started = time.time()
+        while time.time() - started < timeout:
             try:
-                for mail in self.list_parsed_mails(target_email, jwt=jwt):
-                    mail_id = str(mail.get("id") or mail.get("message_id") or "")
-                    if mail_id and mail_id in seen_ids:
+                data = self._get_json(account, "/api/parsed_mails", {"limit": 20, "offset": 0})
+                rows = data.get("results") or data.get("mails") or []
+                for row in rows:
+                    mid = str(row.get("id") or row.get("message_id") or "")
+                    if mid in seen_ids:
                         continue
-                    if mail_id:
-                        seen_ids.add(mail_id)
-
-                    sender = str(mail.get("sender") or mail.get("source") or "").lower()
-                    subject = str(mail.get("subject") or "")
-                    text = str(mail.get("text") or "")
-                    html_body = html.unescape(re.sub(r"<[^>]+>", " ", str(mail.get("html") or "")))
-                    haystack = f"{sender}\n{subject}\n{text}\n{html_body}"
-                    haystack_lower = haystack.lower()
-
-                    if sender_filters and not any(s in sender for s in sender_filters):
+                    seen_ids.add(mid)
+                    created_at = str(row.get("created_at") or "")
+                    parsed_ts = _parse_created_at(created_at)
+                    if start_after and parsed_ts and parsed_ts < start_after:
                         continue
-                    if keyword and keyword not in haystack_lower:
-                        continue
-
-                    code = self.extract_code(haystack, exclude_codes=exclude_codes)
+                    haystack = "\n".join(
+                        str(row.get(k) or "") for k in ("sender", "source", "subject", "text", "html")
+                    )
+                    if keyword and keyword.lower() not in haystack.lower():
+                        sender_subject = " ".join(str(row.get(k) or "") for k in ("sender", "source", "subject"))
+                        if "openai" not in sender_subject.lower() and "verification" not in sender_subject.lower():
+                            continue
+                    code = extract_verification_code(row)
                     if code:
-                        self._log(f"code found: {code}")
+                        self._log(f"获取到验证码: {code}")
                         return code
-            except Exception as e:
-                self._log(f"poll failed: {e}")
-
+                self._log(f"未找到验证码, {interval}s 后重试...")
+            except RuntimeError as exc:
+                if "限流" in str(exc):
+                    time.sleep(max(interval, 10))
+                    continue
+                raise
             time.sleep(interval)
-
-        self._log("code polling timed out")
-        return None
+        return ""
 
 
-if __name__ == "__main__":
-    import argparse
+def _parse_created_at(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    from datetime import datetime
 
-    p = argparse.ArgumentParser(description="Cloudflare Temp Email client")
-    p.add_argument("--base-url", required=True)
-    p.add_argument("--admin-auth", default="")
-    p.add_argument("--domain", default="")
-    p.add_argument("--site-password", default="")
-    p.add_argument("--email", default="")
-    p.add_argument("--jwt", default="")
-    p.add_argument("--command", choices=["create", "code"], default="create")
-    p.add_argument("-v", "--verbose", action="store_true")
-    args = p.parse_args()
-
-    client = TempMailClient(
-        args.base_url,
-        admin_auth=args.admin_auth,
-        domain=args.domain,
-        site_password=args.site_password,
-        verbose=args.verbose,
-    )
-    if args.command == "create":
-        print(client.create_address())
-    else:
-        print(client.poll_mail_for_code(args.email, jwt=args.jwt, timeout=120))
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            continue
+    return 0.0

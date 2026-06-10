@@ -59,68 +59,6 @@ def _log(msg: str):
     print(f"  [AUTH] {msg}")
 
 
-def _poll_email_code(
-    provider: str,
-    target_email: str,
-    icloud_cookies: Dict[str, str],
-    verbose: bool,
-    imap_user: str = "",
-    imap_password: str = "",
-    tempmail_base_url: str = "",
-    tempmail_jwt: str = "",
-    tempmail_site_password: str = "",
-    mailmanage_api_key: str = "",
-    mailmanage_base_url: str = "",
-    mailmanage_keyword: str = "gpt",
-    timeout: int = 60,
-) -> Optional[str]:
-    """Poll a supported mailbox provider for a 6-digit OpenAI binding code."""
-    provider = (provider or "icloud").lower()
-    sender_filters = ["openai", "noreply", "verification", "no-reply"]
-
-    if provider == "tempmail":
-        from tempmail_client import TempMailClient
-
-        client = TempMailClient(
-            base_url=tempmail_base_url,
-            site_password=tempmail_site_password,
-            verbose=verbose,
-        )
-        return client.poll_mail_for_code(
-            target_email=target_email,
-            jwt=tempmail_jwt,
-            sender_filters=sender_filters,
-            keyword="openai",
-            timeout=timeout,
-        )
-
-    if provider == "mailmanage":
-        from mailmanage_client import MailManageClient
-
-        client = MailManageClient(
-            api_key=mailmanage_api_key,
-            base_url=mailmanage_base_url,
-            verbose=verbose,
-        )
-        result = client.get_code(
-            target_email,
-            keyword=mailmanage_keyword or "gpt",
-            timeout=timeout,
-        )
-        return (result or {}).get("code")
-
-    from icloud_hme import ICloudHME
-
-    icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
-    return icloud.poll_mail_for_code(
-        target_email=target_email,
-        sender_filters=sender_filters,
-        timeout=timeout,
-        imap_user=imap_user,
-        imap_password=imap_password,
-    )
-
-
 # ============================================================
 # Sentinel PoW (简化版，内联用)
 # ============================================================
@@ -216,6 +154,106 @@ class _Sentinel:
 
 
 # ============================================================
+# HTML form 解析（consent 页面回退分支）
+# ============================================================
+
+def _extract_form(page_url: str, html: str):
+    """从 HTML 中提取第一个 <form> 的 action 和 input 字段"""
+    from urllib.parse import urljoin
+    import re as _re
+    form_match = _re.search(r"<form[^>]*action=[\"']([^\"']+)[\"'][^>]*>", html, _re.IGNORECASE)
+    if not form_match:
+        return None, {}
+    action = urljoin(page_url, form_match.group(1))
+    fields = {}
+    for m in _re.finditer(r"<input[^>]*name=[\"']([^\"']+)[\"'][^>]*value=[\"']([^\"']*)[\"'][^>]*>", html, _re.IGNORECASE):
+        fields[m.group(1)] = m.group(2)
+    return action, fields
+
+
+_OUTLOOK_DOMAIN_PREFIXES = ("outlook.", "hotmail.", "live.", "msn.")
+
+
+def _is_outlook_email(email: str) -> bool:
+    domain = (email or "").strip().lower().partition("@")[2]
+    return any(domain.startswith(prefix) for prefix in _OUTLOOK_DOMAIN_PREFIXES)
+
+
+def _poll_bind_code(
+    bind_email: str,
+    icloud_cookies: Dict[str, str],
+    verbose: bool,
+    timeout: int,
+    imap_user: str,
+    imap_password: str,
+    start_after: float,
+    proxy: str = "",
+    outlook_pool: str = "",
+    tempmail_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    sender_filters = ["openai", "noreply", "verification", "no-reply"]
+    if tempmail_config:
+        from tempmail_client import TempMailClient
+
+        client = TempMailClient(
+            base_url=tempmail_config.get("base_url", ""),
+            jwt=tempmail_config.get("jwt", ""),
+            site_password=tempmail_config.get("site_password", ""),
+            admin_password=tempmail_config.get("admin_password", ""),
+            domain=tempmail_config.get("domain", ""),
+            name_prefix=tempmail_config.get("name_prefix", "gpt"),
+            pool=tempmail_config.get("pool", ""),
+            verbose=verbose,
+        )
+        return client.poll_code(
+            email=bind_email,
+            keyword=tempmail_config.get("keyword", "openai"),
+            timeout=timeout,
+            start_after=start_after,
+        ) or ""
+
+    if _is_outlook_email(bind_email):
+        from outlook_mail import get_outlook_account, poll_outlook_for_code
+
+        account = get_outlook_account(bind_email, outlook_pool or "outlook.txt")
+        code = poll_outlook_for_code(
+            account,
+            sender_filters=sender_filters,
+            timeout=timeout,
+            verbose=verbose,
+            proxy=proxy,
+            start_after=start_after,
+        ) or ""
+        if code or not proxy:
+            return code
+        return poll_outlook_for_code(
+            account,
+            sender_filters=sender_filters,
+            timeout=timeout,
+            verbose=verbose,
+            proxy="",
+            start_after=start_after,
+        ) or ""
+
+    from icloud_hme import ICloudHME
+
+    icloud = ICloudHME(icloud_cookies or {}, verbose=verbose)
+    return icloud.poll_mail_for_code(
+        target_email=bind_email,
+        sender_filters=sender_filters,
+        timeout=timeout,
+        imap_user=imap_user,
+        imap_password=imap_password,
+        start_after=start_after,
+    ) or ""
+
+
+def _prompt_bind_code(bind_email: str) -> str:
+    print(f"\n  [!] 自动轮询超时, 目标邮箱: {bind_email}")
+    return input("  [?] 输入6位验证码: ").strip()
+
+
+# ============================================================
 # 后半段引擎 (真实端点)
 # ============================================================
 
@@ -246,6 +284,10 @@ class OAuthSecondHalf:
 
     def _l(self, msg): 
         if self.verbose: _log(msg)
+
+    def _post_form(self, action: str, fields: dict) -> "requests.Response":
+        """POST 提交 HTML form（用于 consent 回退分支）"""
+        return self.session.post(action, data=fields, allow_redirects=False)
 
     def _sentinel_token(self, flow: str) -> str:
         if flow not in self._sentinel_cache:
@@ -298,7 +340,7 @@ class OAuthSecondHalf:
     def submit_phone(self, phone: str) -> Dict:
         """
         [3] POST /api/accounts/authorize/continue
-           {"username":{"kind":"phone_number","value":"+56947125968"}}
+           {"username":{"kind":"phone_number","value":"+15550000000"}}
         返回: {continue_url, page:{type, payload}}
         设置: oai-client-auth-session cookie
         """
@@ -349,7 +391,7 @@ class OAuthSecondHalf:
     def send_bind_email(self, email: str) -> Dict:
         """
         [6] POST /api/accounts/add-email/send
-           {"email":"botch.sear_8w@icloud.com"}
+           {"email":"alias@icloud.com"}
         返回: {continue_url:"/email-verification", page:{type:"email_otp_verification"}}
         """
         self._l(f"[6] 发送绑定邮箱: {email}")
@@ -556,15 +598,10 @@ def run_second_half(
     bind_code: str = "",
     imap_user: str = "",
     imap_password: str = "",
-    email_provider: str = "icloud",
-    tempmail_base_url: str = "",
-    tempmail_jwt: str = "",
-    tempmail_site_password: str = "",
-    mailmanage_api_key: str = "",
-    mailmanage_base_url: str = "",
-    mailmanage_keyword: str = "gpt",
     sub2api_session_id: str = "",
     sub2api_state: str = "",
+    outlook_pool: str = "",
+    tempmail_config: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """
     完整后半段 (基于真实端点):
@@ -586,6 +623,7 @@ def run_second_half(
         if verbose: _log(msg)
 
     flow = OAuthSecondHalf(proxy=proxy, verbose=verbose)
+    mail_label = "TempMail" if tempmail_config else ("Outlook" if _is_outlook_email(icloud_email) else "iCloud/IMAP")
 
     try:
         # 解析 OAuth URL 参数
@@ -674,31 +712,29 @@ def run_second_half(
         elif "email_otp_verification" in page_type:
             # 先尝试发新的绑定邮件
             log("[5] email_otp_verification, 先发新邮箱 ...")
+            poll_start_after = time.time()
             if icloud_email:
                 r_send = flow.send_bind_email(icloud_email)
                 send_err = r_send.get("error", "")
                 send_page = (r_send.get("page") or {}).get("type", "")
                 log(f"[6] send result: error={send_err} page={send_page}")
                 if not send_err and "otp_verification" in send_page:
-                    log("[6] 新验证码已发送,等待IMAP...")
+                    log(f"[6] Verification email sent, waiting {mail_label} ...")
 
             code_bind = bind_code
             if not code_bind:
-                log("[7] iCloud 收验证码 ...")
-                code_bind = _poll_email_code(
-                    provider=email_provider,
-                    target_email=icloud_email,
+                log(f"[7] {mail_label} polling code ...")
+                code_bind = _poll_bind_code(
+                    bind_email=icloud_email,
                     icloud_cookies=icloud_cookies,
                     verbose=verbose,
+                    timeout=60,
                     imap_user=imap_user,
                     imap_password=imap_password,
-                    tempmail_base_url=tempmail_base_url,
-                    tempmail_jwt=tempmail_jwt,
-                    tempmail_site_password=tempmail_site_password,
-                    mailmanage_api_key=mailmanage_api_key,
-                    mailmanage_base_url=mailmanage_base_url,
-                    mailmanage_keyword=mailmanage_keyword,
-                    timeout=60,
+                    start_after=poll_start_after,
+                    proxy=proxy,
+                    outlook_pool=outlook_pool,
+                    tempmail_config=tempmail_config,
                 )
                 if not code_bind:
                     print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")
@@ -732,32 +768,30 @@ def run_second_half(
         else:
             # 需要绑定新邮箱 (add_email)
             log(f"[6] 绑定邮箱: {icloud_email} ...")
+            poll_start_after = time.time()
             r = flow.send_bind_email(icloud_email)
             if r.get("error"):
                 log(f"[6] 失败: {r.get('error')}")
                 return {"ok": False, "error": f"send_bind_email: {r.get('error')}"}
             log(f"[6] page: {(r.get('page') or {}).get('type', '?')}")
 
-            # ---- [7] iCloud 收码 ----
-            log("[7] iCloud 收验证码 ...")
+            # ---- [7] Poll code from current mail provider ----
+            log(f"[7] {mail_label} polling code ...")
             if bind_code:
                 code_bind = bind_code
                 log(f"[7] 使用手动验证码: {code_bind}")
             else:
-                code_bind = _poll_email_code(
-                    provider=email_provider,
-                    target_email=icloud_email,
+                code_bind = _poll_bind_code(
+                    bind_email=icloud_email,
                     icloud_cookies=icloud_cookies,
                     verbose=verbose,
+                    timeout=60,
                     imap_user=imap_user,
                     imap_password=imap_password,
-                    tempmail_base_url=tempmail_base_url,
-                    tempmail_jwt=tempmail_jwt,
-                    tempmail_site_password=tempmail_site_password,
-                    mailmanage_api_key=mailmanage_api_key,
-                    mailmanage_base_url=mailmanage_base_url,
-                    mailmanage_keyword=mailmanage_keyword,
-                    timeout=60,
+                    start_after=poll_start_after,
+                    proxy=proxy,
+                    outlook_pool=outlook_pool,
+                    tempmail_config=tempmail_config,
                 )
                 if not code_bind:
                     print(f"\n  [!] 自动轮询超时, 目标邮箱: {icloud_email}")

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 ChatGPT Auto Register - Fully automated phone-based registration.
 
@@ -68,6 +68,60 @@ def _retry_call(fn, max_retries=2, delay=2, label=""):
                 print(f"  [{label}] 失败 ({e})，{delay}s 后重试 ({attempt+1}/{max_retries})...")
             _time.sleep(delay)
 
+
+class StopRequested(RuntimeError):
+    """Raised when an external stop signal interrupts the registration flow."""
+
+
+def _get_number_with_retry(
+    sms: SmsBower,
+    service: str,
+    country: str,
+    provider_ids: str = "",
+    min_price: str = "",
+    max_price: str = "",
+    verbose: bool = True,
+    retry_delay: int = 2,
+    stop_requested=None,
+):
+    countries = [
+        c.strip()
+        for c in str(country or "").replace("，", ",").replace(";", ",").replace(" ", ",").split(",")
+        if c.strip()
+    ] or ["151"]
+    retry_count = 0
+    country_index = 0
+    country_fail_count = 0
+    switch_after = 3
+    while True:
+        if stop_requested and stop_requested():
+            raise StopRequested("stopped while waiting for phone number")
+        current_country = countries[country_index % len(countries)]
+        try:
+            aid, phone = sms.get_number(
+                service=service,
+                country=current_country,
+                provider_ids=provider_ids,
+                min_price=min_price,
+                max_price=max_price,
+            )
+            return aid, phone, current_country
+        except Exception as e:
+            retry_count += 1
+            country_fail_count += 1
+            if stop_requested and stop_requested():
+                raise StopRequested("stopped while waiting for phone number")
+            if country_fail_count >= switch_after:
+                old_country = current_country
+                country_index = (country_index + 1) % len(countries)
+                country_fail_count = 0
+                if verbose and len(countries) > 1:
+                    next_country = countries[country_index % len(countries)]
+                    print(f"  [国家切换] 国家 {old_country} 连续失败 {switch_after} 次，切换到 {next_country}")
+            if verbose:
+                print(f"  [拿手机号] 国家 {current_country} 失败 ({e})，{retry_delay}s 后重试 (第{retry_count}次)...")
+            _time.sleep(retry_delay)
+
 # ============================================================
 # 配置
 # ============================================================
@@ -78,7 +132,7 @@ def load_config(path: str = None) -> dict:
         "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
         "proxy": "",
         "country": "151",
-        "service": "openai",
+        "service": "dr",
         "code_timeout": 30,
     }
     candidates = [path, "config.json", str(Path(__file__).parent / "config.json")]
@@ -90,16 +144,14 @@ def load_config(path: str = None) -> dict:
             for k in ["smsbower", "register"]:
                 if k in found:
                     config[k].update(found[k])
-            for k in ["proxy", "country", "service", "code_timeout", "sms_timeout"]:
+            for k in ["proxy", "country", "service", "code_timeout"]:
                 if k in found:
                     config[k] = found[k]
             # Passthrough extra keys (e.g. "gui")
             for k, v in found.items():
-                if k not in {"smsbower", "register", "proxy", "country", "service", "code_timeout", "sms_timeout"}:
+                if k not in {"smsbower", "register", "proxy", "country", "service", "code_timeout"}:
                     config[k] = v
             break
-    if "sms_timeout" in config:
-        config["code_timeout"] = int(config.get("sms_timeout") or config.get("code_timeout") or 30)
     if os.environ.get("SMSBOWER_KEY"):
         config["smsbower"]["api_key"] = os.environ["SMSBOWER_KEY"]
     proxy_env = os.environ.get("PROXY") or os.environ.get("HTTPS_PROXY")
@@ -120,6 +172,8 @@ def register_one(
     verbose: bool = True,
     step_retries: int = 2,
     create_account_max_retries: int = 20,
+    phone_retry_delay: int = 2,
+    stop_requested=None,
 ) -> dict:
     service = config["service"]
     country = config["country"]
@@ -138,16 +192,20 @@ def register_one(
     sr = step_retries
 
     try:
-        aid, phone_raw = sms.get_number(
+        aid, phone_raw, used_country = _get_number_with_retry(
+            sms,
             service=service,
             country=country,
             provider_ids=provider_ids,
             min_price=min_price,
             max_price=max_price,
+            verbose=verbose,
+            retry_delay=phone_retry_delay,
+            stop_requested=stop_requested,
         )
         phone = "+" + phone_raw if not phone_raw.startswith("+") else phone_raw
         if verbose:
-            print(f"  手机号: {phone}  激活ID: {aid}")
+            print(f"  手机号: {phone}  国家: {used_country}  激活ID: {aid}")
         sms.set_ready()
 
         reg = ChatGPTRegister(proxy=config["proxy"])
@@ -167,18 +225,10 @@ def register_one(
         if verbose:
             print(f"  验证码已发送到 {phone}")
 
-        code_timeout = int(config.get("code_timeout") or config.get("sms_timeout") or 30)
-        code = sms.wait_code(timeout=code_timeout)
+        code = sms.wait_code(timeout=config["code_timeout"])
         if not code:
-            if verbose:
-                print(f"  验证码超时，重发一次到 {phone}")
-            _retry_call(lambda: reg.send_otp(continue_url), sr, label="重发验证码")
-            if verbose:
-                print(f"  验证码已重新发送到 {phone}")
-            code = sms.wait_code(timeout=code_timeout)
-            if not code:
-                sms.cancel()
-                return {"ok": False, "phone": phone, "error": "验证码超时"}
+            sms.cancel()
+            return {"ok": False, "phone": phone, "error": "验证码超时"}
 
         if verbose:
             print(f"  收到验证码: {code}")
@@ -232,6 +282,8 @@ def register_one(
             "session_token": token, "access_token": access_token, "activation_id": aid,
         }
 
+    except StopRequested:
+        raise
     except Exception as e:
         try: sms.cancel()
         except Exception: pass
@@ -246,9 +298,8 @@ def main():
     parser.add_argument("--config", "-c", type=str, help="配置文件路径")
     parser.add_argument("--count", "-n", type=int, default=1, help="目标成功数量")
     parser.add_argument("--country", type=str, help="国家 ID (默认 151=智利)")
-    parser.add_argument("--service", type=str, help="服务代码 (默认 openai)")
+    parser.add_argument("--service", type=str, help="服务代码 (默认 dr=OpenAI)")
     parser.add_argument("--provider", type=str, default="", help="指定运营商 ID")
-    parser.add_argument("--min-price", type=str, default="", help="最低价格")
     parser.add_argument("--max-price", type=str, default="", help="最高价格")
     parser.add_argument("--proxy", type=str, help="代理地址")
     parser.add_argument("--password", type=str, help="密码 (留空随机)")
@@ -303,7 +354,7 @@ def main():
         print(f"\n第 {attempt} 次 [{ok_count}/{args.count}]")
         try:
             result = register_one(sms, config, provider_ids=args.provider,
-                                  min_price=args.min_price, max_price=args.max_price, step_retries=args.retry,
+                                  max_price=args.max_price, step_retries=args.retry,
                                   create_account_max_retries=args.create_retry,
                                   verbose=True)
         except Exception as e:

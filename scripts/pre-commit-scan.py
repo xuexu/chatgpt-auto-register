@@ -5,7 +5,7 @@ import os, re, subprocess, sys
 SAFE_EMAILS = {
     'xxx@icloud.com', 'yourname@icloud.com', 'alias@icloud.com',
     'example@icloud.com', 'test@icloud.com', 'user@icloud.com',
-    'botch.sear_8w@icloud.com',
+    'alias@icloud.com',
 }
 
 RULES = [

@@ -49,6 +49,18 @@ CODE_CHALLENGE_METHOD = "S256"
 # 工具函数
 # ============================================================
 
+def _json_or_raise(resp, label: str) -> Dict:
+    try:
+        return resp.json()
+    except Exception as e:
+        content_type = resp.headers.get("content-type", "")
+        snippet = (resp.text or "")[:300].replace("\n", " ").replace("\r", " ")
+        raise RuntimeError(
+            f"{label} returned non-JSON HTTP {resp.status_code} "
+            f"content-type={content_type!r}: {snippet}"
+        ) from e
+
+
 def generate_code_verifier(length: int = 64) -> str:
     """生成 PKCE code_verifier"""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
@@ -279,13 +291,14 @@ class OpenAI_OAuth:
         从 SUB2API 获取 OAuth 授权 URL
         返回 (oauth_url, session_id, state)
         """
+        base = (sub2api_url or "").rstrip("/")
         # 登录
         resp = requests.post(
-            f"{sub2api_url}/api/v1/auth/login",
+            f"{base}/api/v1/auth/login",
             json={"email": sub2api_email, "password": sub2api_password},
             timeout=30,
         )
-        data = resp.json()
+        data = _json_or_raise(resp, "SUB2API login")
         if data.get("code") != 0:
             raise RuntimeError(f"SUB2API 登录失败: {data}")
         token = data["data"]["access_token"]
@@ -296,12 +309,12 @@ class OpenAI_OAuth:
             body["proxy_id"] = proxy_id
 
         resp = requests.post(
-            f"{sub2api_url}/api/v1/admin/openai/generate-auth-url",
+            f"{base}/api/v1/admin/openai/generate-auth-url",
             json=body,
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
         )
-        data = resp.json()
+        data = _json_or_raise(resp, "SUB2API generate-auth-url")
         if data.get("code") != 0:
             raise RuntimeError(f"生成 OAuth URL 失败: {data}")
 
@@ -309,6 +322,8 @@ class OpenAI_OAuth:
         oauth_url = result["auth_url"]
         session_id = result["session_id"]
         state = result.get("state", "")
+        if not state:
+            state = parse_qs(urlparse(oauth_url).query).get("state", [""])[0]
 
         return oauth_url, session_id, state
 

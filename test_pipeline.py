@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-测试脚本: +56978682516 → OAuth → 绑iCloud → code → SUB2API(CHATGPT分组)
+测试脚本: +15550000001 → OAuth → 绑iCloud → code → SUB2API(CHATGPT分组)
 
 不得走 at 偏方，必须走 generate-auth-url → exchange-code 正规路径
 """

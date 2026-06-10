@@ -220,14 +220,7 @@ def api_logs():
 @auth.admin_required
 def api_assets():
     d = request.json or {}
-    for k in [
-        "icloud_cookies",
-        "mailmanage_key",
-        "tempmail_base_url",
-        "tempmail_admin_auth",
-        "tempmail_domain",
-        "tempmail_site_password",
-    ]:
+    for k in ["icloud_cookies", "mailmanage_key"]:
         if k in d and d[k]:
             db.set_admin_asset(k, d[k])
     return jsonify({"ok": True})
@@ -236,17 +229,8 @@ def api_assets():
 @app.route("/api/admin/assets", methods=["GET"])
 @auth.admin_required
 def api_assets_get():
-    return jsonify({
-        "ok": True,
-        "icloud_cookies": bool(db.get_admin_asset("icloud_cookies")),
-        "mailmanage_key": bool(db.get_admin_asset("mailmanage_key")),
-        "tempmail": {
-            "base_url": bool(db.get_admin_asset("tempmail_base_url")),
-            "admin_auth": bool(db.get_admin_asset("tempmail_admin_auth")),
-            "domain": db.get_admin_asset("tempmail_domain"),
-            "site_password": bool(db.get_admin_asset("tempmail_site_password")),
-        },
-    })
+    return jsonify({"ok": True, "icloud_cookies": bool(db.get_admin_asset("icloud_cookies")),
+                     "mailmanage_key": bool(db.get_admin_asset("mailmanage_key"))})
 
 
 # ── Start ──

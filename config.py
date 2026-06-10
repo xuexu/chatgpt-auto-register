@@ -5,7 +5,7 @@ import secrets
 
 # Admin preset account (created on first run)
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = "YOUR_ADMIN_PASSWORD"
 
 # PostgreSQL connection
 DB_URL = os.environ.get("DB_URL", "postgresql://postgres:postgres@localhost:5432/chatgpt_reg")
@@ -20,4 +20,4 @@ DAILY_INVITE_QUOTA = 20
 
 # Admin default assets
 MAILMANAGE_KEY = os.environ.get("MAILMANAGE_KEY", "")
-MAILMANAGE_BASE_URL = os.environ.get("MAILMANAGE_BASE_URL", "")
+MAILMANAGE_BASE_URL = "https://mailmanage.lizaliza.top"

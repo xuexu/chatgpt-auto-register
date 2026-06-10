@@ -1,4 +1,4 @@
-﻿"""Registration engine - thread-safe, multi-user, with SSE streaming"""
+"""Registration engine - thread-safe, multi-user, with SSE streaming"""
 
 import json
 import threading
@@ -40,24 +40,6 @@ def get_email_for_user(user_id: int, sse_q: queue.Queue) -> str:
                 db.consume_icloud_use(icloud["id"])
                 raise RuntimeError(f"iCloud failed: {e}")
     else:
-        tempmail_base_url = db.get_admin_asset("tempmail_base_url") or ""
-        tempmail_admin_auth = db.get_admin_asset("tempmail_admin_auth") or ""
-        if tempmail_base_url:
-            sse_q.put({"msg": "Using TempMail email (free)...", "tag": "info", "time": _ts()})
-            with mailmanage_lock:
-                try:
-                    from tempmail_client import TempMailClient
-                    tm = TempMailClient(
-                        base_url=tempmail_base_url,
-                        admin_auth=tempmail_admin_auth,
-                        domain=db.get_admin_asset("tempmail_domain") or "",
-                        site_password=db.get_admin_asset("tempmail_site_password") or "",
-                        verbose=False,
-                    )
-                    return tm.get_available_email()
-                except Exception as e:
-                    sse_q.put({"msg": f"TempMail failed, fallback to MailManage: {e}", "tag": "warn", "time": _ts()})
-
         sse_q.put({"msg": "Using MailManage email (free)...", "tag": "info", "time": _ts()})
         with mailmanage_lock:
             from mailmanage_client import MailManageClient
@@ -113,8 +95,6 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
     config_data = db.get_user_config(user_id)
     proxy = config_data.get("proxy", "") or "socks5h://127.0.0.1:10808"
     country = config_data.get("country", "") or "151"
-    service = config_data.get("service", "") or "openai"
-    min_price = config_data.get("min_price", "") or ""
     max_price = config_data.get("max_price", "") or ""
     sms_timeout = config_data.get("sms_timeout", 30) or 30
     smsbower_key = config_data.get("smsbower_key", "") or ""
@@ -125,9 +105,9 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
     sms = SmsBower(smsbower_key)
     reg_config = {
-        "service": service,
+        "service": "dr",
         "country": country,
-        "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
+        "register": {"password": "TempPass123!", "name": "A", "birthdate": "2000-01-01"},
         "proxy": proxy,
         "code_timeout": sms_timeout,
     }
@@ -167,13 +147,25 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 result = ar.register_one(
-                    sms, reg_config, verbose=True, step_retries=2, max_price=max_price,
-                    min_price=min_price,
+                    sms,
+                    reg_config,
+                    verbose=True,
+                    step_retries=2,
+                    max_price=max_price,
+                    stop_requested=stop_ev.is_set,
                 )
             for line in buf.getvalue().split("\n"):
                 if line.strip():
                     sse_q.put({"msg": line.strip(), "tag": "info", "time": _ts()})
 
+        except ar.StopRequested:
+            sse_q.put({"msg": "Stopped while waiting for phone number", "tag": "warn", "time": _ts()})
+            break
+        except Exception as e:
+            sse_q.put({"msg": f"Error: {e}", "tag": "error", "time": _ts()})
+            continue
+
+        try:
             phone = result.get("phone", "?")
             status = "ok" if result["ok"] else "fail"
             db.log_reg(user_id, phone, status, email, result.get("error", ""))
@@ -181,18 +173,9 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
             if result["ok"]:
                 ok_count += 1
-                if email:
-                    try:
-                        from tempmail_client import TempMailClient
-                        tempmail_base_url = db.get_admin_asset("tempmail_base_url") or ""
-                        if tempmail_base_url and email.lower() in getattr(TempMailClient(tempmail_base_url), "_tokens", {}):
-                            TempMailClient(tempmail_base_url).mark_used(email)
-                    except Exception:
-                        pass
                 sse_q.put({"msg": f"OK: {phone} -> {email}", "tag": "success", "time": _ts()})
             else:
                 sse_q.put({"msg": f"FAIL: {phone} - {result.get('error','')}", "tag": "error", "time": _ts()})
-
         except Exception as e:
             sse_q.put({"msg": f"Error: {e}", "tag": "error", "time": _ts()})
 

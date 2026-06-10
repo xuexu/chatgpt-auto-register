@@ -1,4 +1,4 @@
-﻿{
+{
     "smsbower": {
         "api_key": "YOUR_API_KEY"
     },
@@ -9,9 +9,21 @@
     },
     "proxy": "",
     "country": "151",
-    "service": "openai",
+    "service": "dr",
     "code_timeout": 30,
+    "min_price": "",
     "max_price": "",
+    "email_provider": "",
+    "tempmail": {
+        "base_url": "",
+        "jwt": "",
+        "site_password": "",
+        "admin_password": "",
+        "domain": "",
+        "name_prefix": "gpt",
+        "keyword": "openai",
+        "pool": ""
+    },
 
     "phase2": {
         "icloud_cookies": "cookies.json",
@@ -21,11 +33,6 @@
         "sub2api_email": "",
         "sub2api_password": "",
         "sub2api_group": "CHATGPT",
-        "email_provider": "icloud",
-        "tempmail_base_url": "",
-        "tempmail_admin_auth": "",
-        "tempmail_domain": "",
-        "tempmail_site_password": "",
         "bind_email": ""
     }
 }

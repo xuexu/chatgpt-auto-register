@@ -1,167 +1,201 @@
+# ChatGPT 自动注册机
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
+> 纯协议逆向实现的 ChatGPT 手机号全自动注册工具。无需浏览器，内存占用 ~20MB，一行命令拿号。
+
+基于 [Anything Analyzer](https://github.com/Mouseww/anything-analyzer) 抓包逆向 ChatGPT 手机注册协议，融合 [open-reg-auto](https://github.com/wuchenwl/open-reg-auto) 的 Sentinel 反爬方案和 SMSBower 接码平台，实现从获取号码到拿到 Session Token 的端到端自动化。
+
+**功能特点：**
+- 🚀 纯协议实现，不依赖浏览器，20MB 内存
+- 🔐 curl_cffi 伪装 Chrome TLS 指纹绕过 Cloudflare
+- 🛡️ Sentinel FNV-1a 工作量证明绕过 JavaScript 反爬
+- 📱 SMSBower 全自动接码，无需手动收短信
+- ⚙️ 支持命令行参数、配置文件、环境变量三种配置方式
+
+**交流群：<已移除>**
+
+---
+
 # ChatGPT Auto Register
 
-> 💬 交流群：**1060714372**
-> 🍎 建议搭配 [heartmore/icloud-hme](https://github.com/heartmore/icloud-hme) 食用 — iCloud Hide My Email 纯协议管理工具
+Fully automated ChatGPT phone-based registration using protocol-level reverse engineering.
 
-纯协议逆向实现的 ChatGPT 手机号全自动注册工具。无需浏览器，从获取号码到拿到 Session Token 端到端自动化。
+No browser required. ~20MB memory. One command to get a verified account.
 
-基于 [heartmore/chatgpt-auto-register](https://github.com/heartmore/chatgpt-auto-register) 改进。
+## How it works
 
----
+Three independent techniques combined into one pipeline:
 
-## 原理
+| Layer | Technique | Bypasses |
+|-------|-----------|----------|
+| **Network** | [curl_cffi](https://github.com/lexiforest/curl_cffi) | Chrome TLS fingerprint → Cloudflare |
+| **Anti-bot** | Sentinel PoW (FNV-1a) | JS challenge → auth.openai.com |
+| **SMS** | [SMSBower](https://smsbower.app) API | Automatic OTP retrieval |
 
-三条独立技术组合为一条流水线：
+Based on reverse engineering via [Anything Analyzer](https://github.com/Mouseww/anything-analyzer) and [open-reg-auto](https://github.com/wuchenwl/open-reg-auto).
 
-| 层级 | 技术 | 绕过目标 |
-|------|------|----------|
-| 网络层 | `curl_cffi` Chrome TLS 指纹 | Cloudflare |
-| 反爬层 | Sentinel FNV-1a 工作量证明 | auth.openai.com JS 挑战 |
-| 接码层 | SMSBower / hero-sms / 5sim API | 短信验证码自动获取 |
+## Quick Start
 
-注册流程共 9 步，全程 HTTP API 交互：
-
-```
-SMSBower              ChatGPT / OpenAI
-─────────             ───────────────────
-getNumber() ──┐
-              ├── [01] GET  chatgpt.com/auth/login
-              ├── [02] GET  /api/auth/csrf
-              ├── [03] POST /api/auth/signin/openai
-              ├── [04] GET  auth.openai.com/authorize (OAuth 重定向)
-手机号 ───────┤
-              ├── [05] POST /api/accounts/user/register
-              ├── [06] GET  /api/accounts/phone-otp/send
-wait_code() ◄─┤
-收到验证码 ───┘
-              ├── [07] POST /api/accounts/phone-otp/validate
-              ├── [08] POST /api/accounts/create_account
-              └── [09] GET  /api/auth/callback/openai → session_token
-```
-
----
-
-## 快速开始
-
-### 1. 安装依赖
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置
+### 2. Configure
 
 ```bash
 cp config.example.json config.json
 ```
 
-编辑 `config.json`，填写 SMSBower API Key：
+Edit `config.json` - fill in your SMSBower API key:
 
 ```json
 {
-  "smsbower": { "api_key": "YOUR_KEY" },
-  "proxy": "socks5h://127.0.0.1:10808",
-  "country": "151",
-  "service": "dr"
+    "smsbower": {
+        "api_key": "YOUR_KEY_HERE"
+    },
+    "proxy": "socks5h://127.0.0.1:10808",
+    "country": "151"
 }
 ```
 
-### 3. 运行
+Or use environment variables:
+```bash
+set SMSBOWER_KEY=YOUR_KEY_HERE
+set HTTPS_PROXY=socks5h://127.0.0.1:10808
+```
+
+### 3. Run
 
 ```bash
-# Web GUI（推荐）
-python web_gui.py
+# Interactive mode
+python auto_register.py
+
+# Register 3 accounts
+python auto_register.py -n 3
+
+# Use specific country
+python auto_register.py --country 151 --service dr
+
+# With custom password
+python auto_register.py --password "MyPassword123"
+```
+
+## Registration flow
+
+```
+SMSBower                   ChatGPT Protocol
+─────────                  ────────────────
+getNumber() ──────┐
+                   │
+                   ├──► GET  chatgpt.com/auth/login        (cookies)
+                   ├──► GET  /api/auth/csrf               (csrf token)
+                   ├──► POST /api/auth/signin/openai       (initiate)
+                   ├──► GET  auth.openai.com/authorize     (OAuth redirect)
+                   ├──► GET  /create-account/password      (session est.)
+Phone number ──────┤
+                   ├──► POST /api/accounts/user/register   (phone + password)
+                   ├──► GET  /api/accounts/phone-otp/send  (trigger SMS)
+wait_code() ◄──────┤
+                   │
+SMS received ──────┘
+                   ├──► POST /api/accounts/phone-otp/validate (verify code)
+                   ├──► POST /api/accounts/create_account    (profile)
+                   └──► GET  /api/auth/callback/openai       (session token)
+```
+
+## Configuration reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `smsbower.api_key` | (required) | SMSBower API key |
+| `register.password` | (random) | Account password (auto-generated if empty) |
+| `register.name` | `A` | Display name |
+| `register.birthdate` | `2000-01-01` | Date of birth |
+| `proxy` | (direct) | Proxy URL, e.g. `socks5h://127.0.0.1:10808` |
+| `country` | `151` | SMSBower country ID (151=Chile, 33=Colombia) |
+| `service` | `dr` | SMSBower service code (dr=OpenAI/ChatGPT) |
+| `code_timeout` | `300` | Seconds to wait for SMS code |
+
+### Verified countries
+
+| Country | ID | Price | Status |
+|---------|----|-------|--------|
+| Chile | 151 | ~$0.04 | Working |
+| Colombia | 33 | ~$0.014 | SMS not received |
+
+More countries can be tested by changing the `country` parameter. Run with `--country <id>` to try different regions.
+
+## Proxy setup
+
+If you are behind a firewall, use `socks5h://` (DNS through proxy) for V2RayN/Clash:
+
+```bash
+python auto_register.py --proxy socks5h://127.0.0.1:10808
+```
+
+## 全链路: Phase 1 + Phase 2
+
+### Phase 1: 手机号注册 ChatGPT
+
+```bash
+# CLI
+python auto_register.py -n 5 --country 151 --max-price 0.039
+
+# Web GUI
+python auto_register.py --gui
 # 浏览器打开 http://127.0.0.1:8080
-
-# 命令行
-python auto_register.py                # 交互模式
-python auto_register.py -n 3           # 注册 3 个号
-python auto_register.py --country 33   # 指定国家
 ```
 
----
-
-## Web GUI
-
-`web_gui.py` 提供完整的 Web 控制台：
-
-- 配置管理（API Key、代理、国家、价格上限）
-- iCloud Cookies 一键导入
-- 实时日志流（SSE）
-- Phase 1 注册 + Phase 2 OAuth 绑邮箱上传全自动
-- 结果下载
-
-### iCloud 邮箱（可选）
-
-如果配置了 SUB2API，注册完成后会自动：
-
-1. 从 iCloud 创建/复用 Hide My Email 别名
-2. OAuth 登录 → 绑定邮箱 → 验证码 → 同意授权
-3. 上传 session_token 到 SUB2API
-
-导入 iCloud Cookies：在 Web GUI 的 "iCloud Cookies 导入" 区域粘贴 JSON，或先运行：
+### Phase 2: OAuth 登录 + 绑邮箱 + 上传 SUB2API
 
 ```bash
-python icloud_hme.py export-cookies
+# 从 SUB2API 生成 OAuth URL
+python openai_oauth.py --sub2api-url https://xxx.com --sub2api-email a@b.com --sub2api-password xxx
+
+# 完整后半段 (需先有 session_token)
+python test_pipeline.py
 ```
 
----
+### 全链路自动编排
 
-## 配置参考
+```bash
+python openai_pipeline.py run \
+  --sms-key YOUR_SMSBOWER_KEY \
+  --icloud-cookies cookies.json \
+  --sub2api-url https://xxx.com \
+  --sub2api-email a@b.com \
+  --sub2api-password xxx
+```
 
-| 键 | 默认值 | 说明 |
-|----|--------|------|
-| `smsbower.api_key` | (必填) | SMSBower API Key |
-| `register.password` | 随机 | 账号密码 |
-| `register.name` | 随机 | 昵称 |
-| `register.birthdate` | 随机 | 生日 |
-| `proxy` | 直连 | 代理，如 `socks5h://127.0.0.1:10808` |
-| `country` | `151` | SMSBower 国家 ID |
-| `service` | `dr` | 服务代码（`dr`=OpenAI） |
-| `max_price` | 不限 | 号码最高单价 |
-| `code_timeout` | `30` | 验证码等待秒数 |
-
----
-
-## 项目结构
+## Project structure
 
 ```
-├── web_gui.py              # Web GUI (Flask + SSE)
-├── auto_register.py        # CLI + register_one 引擎
-├── chatgpt_register.py     # 核心：curl_cffi + Sentinel 协议引擎
-├── smsbower.py             # SMSBower API 客户端
-├── sentinel.py             # OpenAI Sentinel 反爬 PoW
+chatgpt-auto-register/
+├── auto_register.py       # Phase 1 CLI + register_one engine
+├── chatgpt_register.py    # Core: curl_cffi + Sentinel
+├── smsbower.py            # SMSBower API client
+├── sentinel.py            # OpenAI Sentinel anti-bot
+├── web_gui.py             # Flask web GUI
 │
-├── openai_bind_email.py    # Phase 2: OAuth → 绑邮箱 → 验证 → 同意 → code
-├── openai_oauth.py         # OAuth token 交换
-├── openai_pipeline.py      # 全链路编排器
-├── phone_sms.py            # SMSBower / hero-sms / 5sim 多平台接码
-├── icloud_hme.py           # iCloud Hide My Email + cookies 导出
-├── phase2_codex.py         # Phase 2 薄封装
-├── test_pipeline.py        # 日常测试入口
+├── openai_bind_email.py   # Phase 2: OAuth login -> bind email -> consent -> code
+├── openai_oauth.py        # OAuth token exchange
+├── openai_pipeline.py     # Full pipeline orchestrator
+├── phone_sms.py           # SMSBower / hero-sms / 5sim SMS providers
+├── icloud_hme.py          # iCloud Hide My Email + IMAP polling
+├── phase2_codex.py        # Phase 2 thin wrapper
+├── test_pipeline.py       # Daily-use entry point
 │
-├── config.example.json     # 配置模板
-├── requirements.txt        # Python 依赖
+├── config.example.json    # Configuration template
+├── cookies.json           # iCloud cookies (gitignored)
+├── requirements.txt       # Python dependencies
+├── register_results.json  # Output (gitignored)
 └── README.md
 ```
 
----
+## Disclaimer
 
-## 相关项目
-
-- [heartmore/icloud-hme](https://github.com/heartmore/icloud-hme) — iCloud Hide My Email 纯协议管理，一键导出 cookies，搭配本工具完成全链路注册
-
-🔗 友情链接：[LINUX DO](https://linux.do/)
-
----
-
-## 致谢
-
-- [heartmore/chatgpt-auto-register](https://github.com/heartmore/chatgpt-auto-register) — 原始协议逆向实现
-- [open-reg-auto](https://github.com/wuchenwl/open-reg-auto) — Sentinel 工作量证明方案
-
----
-
-## 声明
-
-本项目仅供逆向工程学习和研究使用。使用自动化工具创建账号可能违反 OpenAI 服务条款，请自行承担风险。
+This tool is for educational reverse engineering purposes only. Using automated tools to create accounts may violate OpenAI's Terms of Service. Use at your own risk.
