@@ -13,6 +13,9 @@
     "code_timeout": 30,
     "min_price": "",
     "max_price": "",
+    "web_gui": {
+        "password": ""
+    },
     "email_provider": "",
     "tempmail": {
         "base_url": "",

@@ -7,9 +7,10 @@ from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from flask import Flask, request, jsonify, Response, send_file
+from flask import Flask, request, jsonify, Response, send_file, session, redirect
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("WEB_GUI_SECRET") or "chatgpt-auto-register-web-gui"
 sys.path.insert(0, str(Path(__file__).parent))
 from smsbower import SmsBower
 import auto_register as ar
@@ -37,6 +38,28 @@ def _stop_requested():
         return _state["stop"]
 
 
+def _web_gui_password() -> str:
+    env_password = os.environ.get("WEB_GUI_PASSWORD", "")
+    if env_password:
+        return env_password
+    cfg = _state.get("config") or {}
+    return str((cfg.get("web_gui") or {}).get("password") or "")
+
+
+def _auth_enabled() -> bool:
+    return bool(_web_gui_password())
+
+
+def _is_authenticated() -> bool:
+    if not _auth_enabled():
+        return True
+    return session.get("web_gui_auth") is True
+
+
+def _wants_json_response() -> bool:
+    return request.path.startswith("/api/") or "application/json" in (request.headers.get("Accept") or "")
+
+
 def _empty_stats():
     return {
         "current_success": 0,
@@ -57,6 +80,17 @@ _state = {
     "_code_queues": {},
     "_code_waiting": {},
 }
+
+
+@app.before_request
+def _require_web_gui_auth():
+    if request.path in ("/login", "/logout") or request.path.startswith("/static/"):
+        return None
+    if _is_authenticated():
+        return None
+    if _wants_json_response():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return redirect("/login")
 
 # 鈹€鈹€ 閭鍘婚噸 鈹€鈹€
 def _ensure_stats():
@@ -242,6 +276,26 @@ def _log(msg, tag="info", thread_id=None):
 def index():
     return Response(_HTML, mimetype="text/html; charset=utf-8")
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _auth_enabled():
+        session["web_gui_auth"] = True
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        password = (request.form.get("password") or "").strip()
+        if password == _web_gui_password():
+            session["web_gui_auth"] = True
+            return redirect("/")
+        error = "密码错误"
+    html = _LOGIN_HTML.replace("__ERROR__", error)
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+@app.route("/logout")
+def logout():
+    session.pop("web_gui_auth", None)
+    return redirect("/login")
+
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
     if request.method == "POST":
@@ -255,7 +309,7 @@ def api_config():
                 "tempmail_domain", "tempmail_name_prefix", "tempmail_pool", "tempmail_keyword",
                 "debug_mode", "no_phase2", "phase2_auto_skip",
                 "plus_method", "plus_email", "plus_phone", "plus_pin",
-                "plus_country", "plus_currency"]:
+                "plus_country", "plus_currency", "web_gui_password"]:
             if k in d:
                 if k == "api_key": cfg["smsbower"]["api_key"] = d[k]
                 elif k in ("code_timeout", "sms_timeout"): cfg[k] = int(d[k]) if d[k] else 30
@@ -285,6 +339,9 @@ def api_config():
                 elif k == "tempmail_keyword": cfg["tempmail"] = cfg.get("tempmail", {}); cfg["tempmail"]["keyword"] = d[k]
                 elif k in ("plus_method", "plus_email", "plus_phone", "plus_pin", "plus_country", "plus_currency"):
                     cfg[k] = d[k]
+                elif k == "web_gui_password":
+                    cfg["web_gui"] = cfg.get("web_gui", {})
+                    cfg["web_gui"]["password"] = d[k]
                 elif k == "debug_mode": cfg["debug_mode"] = d[k] == "1" or d[k] is True
                 elif k == "no_phase2": cfg["no_phase2"] = d[k] == "1" or d[k] is True
                 elif k == "phase2_auto_skip": cfg["phase2_auto_skip"] = d[k] == "1" or d[k] is True
@@ -2393,6 +2450,26 @@ def start_gui(host="0.0.0.0", port=7777):
     app.run(host=host, port=port, debug=False, threaded=True)
 
 
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login - ChatGPT Auto Register</title>
+<style>
+:root{color-scheme:light;--paper:#f3efe4;--ink:#0f0e0c;--ink-faint:#9a938a;--rule:rgba(15,14,12,0.16);--red:#b7392d;--serif:Georgia,serif;--sans:"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;font-family:var(--sans)}
+*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;background:var(--paper);color:var(--ink)}
+.box{width:min(420px,calc(100vw - 40px));padding:28px;background:rgba(255,255,255,0.62);border:1px solid var(--rule)}
+h1{font-family:var(--serif);font-weight:500;font-size:24px;margin:0 0 18px}
+label{display:block;font-size:12px;color:var(--ink-faint);margin-bottom:6px}
+input{width:100%;padding:10px 12px;border:1px solid var(--rule);background:rgba(255,255,255,0.78);font:inherit}
+button{width:100%;margin-top:16px;padding:10px 14px;border:0;background:var(--ink);color:var(--paper);font:inherit;cursor:pointer}
+.err{min-height:18px;margin-top:10px;color:var(--red);font-size:13px}
+</style></head><body><form class="box" method="post">
+<h1>Web GUI 鉴权</h1>
+<label>访问密码</label>
+<input type="password" name="password" autofocus autocomplete="current-password">
+<button type="submit">登录</button>
+<div class="err">__ERROR__</div>
+</form></body></html>"""
+
 
 _HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2522,6 +2599,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
     <span class="brand-meta" id="status-msg">就绪</span>
     <nav class="nav-links">
       <button class="nav-action" onclick="downloadResults()">下载结果</button>
+      <button class="nav-action" onclick="location.href='/logout'">退出</button>
       <span class="nav-divider"></span>
       <span class="nav-action" id="balance">-</span>
       <span class="brand-meta">SMSBower</span>
@@ -2560,6 +2638,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
           <label>最低价格</label><input id="min_price" placeholder="留空=不限">
           <label>最高价格</label><input id="max_price" placeholder="留空=不限">
           <label>密码</label><input id="password" placeholder="留空=随机">
+          <label>Web GUI 访问密码</label><input id="web_gui_password" type="password" placeholder="留空=关闭鉴权">
           <div class="row" style="margin-top:10px">
             <div style="flex:1"><label>目标数量</label><input id="count" value="1" type="number" min="1" max="99"></div>
             <div style="flex:1"><label>并发线程</label><input id="concurrency" value="1" type="number" min="1" max="10"></div>
@@ -3191,6 +3270,7 @@ setInterval(pollLog,800);
 function saveConfig(){
     var d={api_key:G('api_key').value,proxy:G('proxy').value,country:G('country').value,
     password:G('password').value,min_price:G('min_price').value,max_price:G('max_price').value,
+    web_gui_password:G('web_gui_password').value,
     sms_timeout:30,code_timeout:30,
     email_provider:G('email_provider').value,
     mailmanage_key:G('mailmanage_key').value,mailmanage_category:G('mailmanage_category').value,
@@ -3514,6 +3594,7 @@ function loadConfig(){
     G('min_price').value=c.min_price||'';
     G('max_price').value=c.max_price||'';
     if(c.register && c.register.password) G('password').value=c.register.password;
+    if(c.web_gui) G('web_gui_password').value=c.web_gui.password||'';
     if(c.icloud){G('imap_user').value=c.icloud.user||'';G('imap_pass').value=c.icloud.pass||'';}
     if(c.sub2api){G('sub2api_url').value=c.sub2api.url||'';G('sub2api_email').value=c.sub2api.email||'';G('sub2api_pwd').value=c.sub2api.pwd||'';G('sub2api_group').value=c.sub2api.group||'CHATGPT';}
     if(c.mailmanage){G('mailmanage_key').value=c.mailmanage.api_key||'';G('mailmanage_category').value=c.mailmanage.category||'safe';G('mailmanage_keyword').value=c.mailmanage.keyword||'gpt';}
