@@ -318,7 +318,7 @@ def api_test_tempmail():
             site_password=tm_config.get("site_password", ""),
             admin_password=tm_config.get("admin_password", ""),
             domain=tm_config.get("domain", ""),
-            name_prefix=tm_config.get("name_prefix", "gpt"),
+            name_prefix=tm_config.get("name_prefix", ""),
             pool=tm_config.get("pool", ""),
             verbose=False,
         )
@@ -1866,7 +1866,7 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                 site_password=tm_config.get("site_password", ""),
                 admin_password=tm_config.get("admin_password", ""),
                 domain=tm_config.get("domain", ""),
-                name_prefix=tm_config.get("name_prefix", "gpt"),
+                name_prefix=tm_config.get("name_prefix", ""),
                 pool=tm_config.get("pool", ""),
                 verbose=False,
             )
@@ -2146,7 +2146,7 @@ def _run(config, count, retries, concurrency=1):
                 site_password=tm_config.get("site_password", ""),
                 admin_password=tm_config.get("admin_password", ""),
                 domain=tm_config.get("domain", ""),
-                name_prefix=tm_config.get("name_prefix", "gpt"),
+                name_prefix=tm_config.get("name_prefix", ""),
                 pool=tm_config.get("pool", ""),
                 verbose=False,
             )
@@ -2602,7 +2602,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
             <label>站点密码</label><input id="tempmail_site_password" type="password" placeholder="可选 x-custom-auth">
             <label>Admin 密码</label><input id="tempmail_admin_password" type="password" placeholder="用于 /admin/new_address；为空则使用 /api/new_address">
             <label>邮箱域名</label><input id="tempmail_domain" placeholder="example.com；留空使用服务默认域名">
-            <label>邮箱名前缀</label><input id="tempmail_name_prefix" value="gpt" placeholder="自动创建邮箱的 name 前缀">
+            <label>邮箱名前缀</label><input id="tempmail_name_prefix" value="" placeholder="可选；留空使用英文人名随机">
             <label>关键词</label><input id="tempmail_keyword" value="openai">
             <label>tempmail 池</label>
             <textarea id="tempmail_pool" rows="5" style="font-family:var(--mono);font-size:11px" placeholder="jwt 或 email----jwt 或 base_url----email----jwt----site_password"></textarea>
@@ -3517,7 +3517,7 @@ function loadConfig(){
     if(c.icloud){G('imap_user').value=c.icloud.user||'';G('imap_pass').value=c.icloud.pass||'';}
     if(c.sub2api){G('sub2api_url').value=c.sub2api.url||'';G('sub2api_email').value=c.sub2api.email||'';G('sub2api_pwd').value=c.sub2api.pwd||'';G('sub2api_group').value=c.sub2api.group||'CHATGPT';}
     if(c.mailmanage){G('mailmanage_key').value=c.mailmanage.api_key||'';G('mailmanage_category').value=c.mailmanage.category||'safe';G('mailmanage_keyword').value=c.mailmanage.keyword||'gpt';}
-    if(c.tempmail){G('tempmail_base_url').value=c.tempmail.base_url||'';G('tempmail_jwt').value=c.tempmail.jwt||'';G('tempmail_site_password').value=c.tempmail.site_password||'';G('tempmail_admin_password').value=c.tempmail.admin_password||'';G('tempmail_domain').value=c.tempmail.domain||'';G('tempmail_name_prefix').value=c.tempmail.name_prefix||'gpt';G('tempmail_pool').value=c.tempmail.pool||'';G('tempmail_keyword').value=c.tempmail.keyword||'openai';}
+    if(c.tempmail){G('tempmail_base_url').value=c.tempmail.base_url||'';G('tempmail_jwt').value=c.tempmail.jwt||'';G('tempmail_site_password').value=c.tempmail.site_password||'';G('tempmail_admin_password').value=c.tempmail.admin_password||'';G('tempmail_domain').value=c.tempmail.domain||'';G('tempmail_name_prefix').value=c.tempmail.name_prefix||'';G('tempmail_pool').value=c.tempmail.pool||'';G('tempmail_keyword').value=c.tempmail.keyword||'openai';}
     G('outlook_pool').value=c.outlook_pool||'';
     syncOutlookPoolEditor(c.outlook_pool||'');
     G('bind_email').value=c.bind_email||'';

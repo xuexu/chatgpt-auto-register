@@ -20,7 +20,7 @@
         "site_password": "",
         "admin_password": "",
         "domain": "",
-        "name_prefix": "gpt",
+        "name_prefix": "",
         "keyword": "openai",
         "pool": ""
     },

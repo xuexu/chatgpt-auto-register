@@ -10,6 +10,7 @@ import re
 import string
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,18 @@ PHRASE_CODE_RE = re.compile(
     r"(?:verification\s+code|temporary\s+code|security\s+code|验证码|驗證碼|代码|代碼)"
     r"[\s\S]{0,120}?(?<!\d)(\d{6,8})(?!\d)",
     re.IGNORECASE,
+)
+FIRST_NAMES = (
+    "amelia", "olivia", "emma", "ava", "sophia", "isabella", "mia", "charlotte",
+    "evelyn", "harper", "luna", "ella", "scarlett", "grace", "chloe", "victoria",
+    "james", "liam", "noah", "oliver", "elijah", "william", "henry", "lucas",
+    "benjamin", "theodore", "jack", "levi", "alexander", "jackson", "daniel",
+)
+LAST_NAMES = (
+    "smith", "johnson", "brown", "taylor", "anderson", "thomas", "martin",
+    "lee", "walker", "hall", "allen", "young", "king", "wright", "scott",
+    "green", "baker", "adams", "nelson", "carter", "mitchell", "perez",
+    "roberts", "turner", "phillips", "campbell", "parker", "evans",
 )
 
 
@@ -118,7 +131,7 @@ class TempMailClient:
         site_password: str = "",
         admin_password: str = "",
         domain: str = "",
-        name_prefix: str = "gpt",
+        name_prefix: str = "",
         pool: str = "",
         used_file: str = DEFAULT_USED_FILE,
         verbose: bool = False,
@@ -128,7 +141,7 @@ class TempMailClient:
         self.site_password = site_password or ""
         self.admin_password = admin_password or ""
         self.domain = (domain or "").strip()
-        self.name_prefix = (name_prefix or "gpt").strip() or "gpt"
+        self.name_prefix = (name_prefix or "").strip()
         self.pool = pool or ""
         self.used_file = used_file
         self.verbose = verbose
@@ -223,9 +236,14 @@ class TempMailClient:
         return data
 
     def _random_name(self) -> str:
-        suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        prefix = re.sub(r"[^a-zA-Z0-9._-]+", "", self.name_prefix)[:24] or "gpt"
-        return f"{prefix}{suffix}"
+        prefix = re.sub(r"[^a-zA-Z0-9._-]+", "", self.name_prefix)[:24]
+        if prefix:
+            suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            return f"{prefix}{suffix}"
+        first = random.choice(FIRST_NAMES)
+        last = random.choice(LAST_NAMES)
+        digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
+        return f"{first}{last}{digits}"
 
     @staticmethod
     def _account_from_create_response(base_url: str, site_password: str, data: dict) -> TempMailAccount:
@@ -332,17 +350,12 @@ class TempMailClient:
         if not account:
             raise RuntimeError(f"tempmail 未找到邮箱配置: {email}")
 
-        seen_ids: set[str] = set()
         started = time.time()
         while time.time() - started < timeout:
             try:
                 data = self._get_json(account, "/api/parsed_mails", {"limit": 20, "offset": 0})
                 rows = data.get("results") or data.get("mails") or []
                 for row in rows:
-                    mid = str(row.get("id") or row.get("message_id") or "")
-                    if mid in seen_ids:
-                        continue
-                    seen_ids.add(mid)
                     created_at = str(row.get("created_at") or "")
                     parsed_ts = _parse_created_at(created_at)
                     if start_after and parsed_ts and parsed_ts < start_after:
@@ -372,11 +385,22 @@ def _parse_created_at(value: str) -> float:
     text = str(value or "").strip()
     if not text:
         return 0.0
-    from datetime import datetime
 
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+    # cloudflare_temp_email stores created_at in UTC. Treat timezone-less
+    # timestamps as UTC; otherwise local timezone parsing will skip valid mails
+    # when the runner is in Asia/Shanghai or another non-UTC timezone.
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            return datetime.strptime(text, fmt).timestamp()
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp()
         except Exception:
             continue
     return 0.0
