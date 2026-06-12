@@ -7,10 +7,13 @@ from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from flask import Flask, request, jsonify, Response, send_file, session, redirect
+from flask import Flask, request, jsonify, Response, send_file, session, redirect, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("WEB_GUI_SECRET") or "chatgpt-auto-register-web-gui"
+app.config.update(SESSION_COOKIE_SAMESITE="Lax")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 sys.path.insert(0, str(Path(__file__).parent))
 from smsbower import SmsBower
 import auto_register as ar
@@ -23,6 +26,8 @@ from outlook_mail import (
 from outlook_manager import _read_used as _read_outlook_used
 
 _STATE_LOCK = threading.RLock()
+_CONFIG_PATH = Path(__file__).parent / "config.json"
+_CONFIG_MTIME = 0.0
 
 
 def _bounded_int(value, default=1, minimum=1, maximum=99):
@@ -38,11 +43,30 @@ def _stop_requested():
         return _state["stop"]
 
 
+def _refresh_config_from_disk(force: bool = False):
+    global _CONFIG_MTIME
+    try:
+        mtime = _CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return _state.get("config") or {}
+    if force or mtime != _CONFIG_MTIME:
+        with _STATE_LOCK:
+            try:
+                _state["config"] = ar.load_config(str(_CONFIG_PATH))
+                _CONFIG_MTIME = mtime
+            except Exception:
+                pass
+    return _state.get("config") or {}
+
+
 def _web_gui_password() -> str:
     env_password = os.environ.get("WEB_GUI_PASSWORD", "")
     if env_password:
         return env_password
-    cfg = _state.get("config") or {}
+    cfg = _refresh_config_from_disk()
+    top_level = str(cfg.get("web_gui_password") or "")
+    if top_level:
+        return top_level
     return str((cfg.get("web_gui") or {}).get("password") or "")
 
 
@@ -58,6 +82,13 @@ def _is_authenticated() -> bool:
 
 def _wants_json_response() -> bool:
     return request.path.startswith("/api/") or "application/json" in (request.headers.get("Accept") or "")
+
+
+def _no_store_response(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 def _empty_stats():
@@ -80,6 +111,7 @@ _state = {
     "_code_queues": {},
     "_code_waiting": {},
 }
+_refresh_config_from_disk(force=True)
 
 
 @app.before_request
@@ -90,7 +122,14 @@ def _require_web_gui_auth():
         return None
     if _wants_json_response():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    return redirect("/login")
+    return redirect(url_for("login"))
+
+
+@app.after_request
+def _disable_auth_page_cache(resp):
+    if request.path in ("/", "/login", "/logout") or request.path.startswith("/api/"):
+        return _no_store_response(resp)
+    return resp
 
 # 鈹€鈹€ 閭鍘婚噸 鈹€鈹€
 def _ensure_stats():
@@ -280,21 +319,24 @@ def index():
 def login():
     if not _auth_enabled():
         session["web_gui_auth"] = True
-        return redirect("/")
+        return redirect(url_for("index"))
     error = ""
     if request.method == "POST":
         password = (request.form.get("password") or "").strip()
         if password == _web_gui_password():
+            session.clear()
             session["web_gui_auth"] = True
-            return redirect("/")
+            return redirect(url_for("index"))
         error = "密码错误"
     html = _LOGIN_HTML.replace("__ERROR__", error)
-    return Response(html, mimetype="text/html; charset=utf-8")
+    return _no_store_response(Response(html, mimetype="text/html; charset=utf-8"))
 
 @app.route("/logout")
 def logout():
-    session.pop("web_gui_auth", None)
-    return redirect("/login")
+    session.clear()
+    resp = redirect(url_for("login"))
+    resp.delete_cookie(app.config.get("SESSION_COOKIE_NAME", "session"), path="/")
+    return _no_store_response(resp)
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
@@ -2599,7 +2641,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
     <span class="brand-meta" id="status-msg">就绪</span>
     <nav class="nav-links">
       <button class="nav-action" onclick="downloadResults()">下载结果</button>
-      <button class="nav-action" onclick="location.href='/logout'">退出</button>
+      <button class="nav-action" onclick="logoutWebGui()">退出</button>
       <span class="nav-divider"></span>
       <span class="nav-action" id="balance">-</span>
       <span class="brand-meta">SMSBower</span>
@@ -3545,6 +3587,7 @@ function stopReg(){
 }
 
 function downloadResults(){window.open('/api/download');}
+function logoutWebGui(){window.location.assign('logout');}
 function clearLog(){
   allLogs=[];threadLogs={};unthreadedLogs=[];activeLogTab='all';nextLogId=1;
   logTabsEl.innerHTML=`<button class="btn-neutral log-tab active" id="log-tab-all" type="button" onclick="setActiveLogTab('all')">全部</button>`;
