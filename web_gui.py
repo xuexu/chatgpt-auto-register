@@ -3198,7 +3198,8 @@ function refreshSelectedOutlookMessages(){
 
 bootstrapOutlookPoolView();
 var logEl=G('log'),logTabsEl=G('log-tabs'),logCursor=0;
-var allLogs=[],threadLogs={},activeLogTab='all';
+var LOG_MAX_PER_THREAD=100;
+var allLogs=[],threadLogs={},unthreadedLogs=[],activeLogTab='all',nextLogId=1;
 var smsbowerCountries=[];
 var zhRegionNames=(window.Intl&&Intl.DisplayNames)?new Intl.DisplayNames(['zh-CN'],{type:'region'}):null;
 
@@ -3216,6 +3217,33 @@ function ensureThreadTab(threadId){
 
 function renderLogLine(item){
   return '<div class="'+escapeHtml(item.tag||'info')+'"><span class="time">'+escapeHtml(item.time||'')+'</span>'+escapeHtml(item.msg||'')+'</div>';
+}
+
+function removeLogsFromAll(removed){
+  if(!removed.length)return;
+  var ids={};
+  removed.forEach(function(item){ids[item._clientLogId]=true;});
+  allLogs=allLogs.filter(function(item){return !ids[item._clientLogId];});
+}
+
+function trimLogBucket(bucket){
+  if(bucket.length<=LOG_MAX_PER_THREAD)return;
+  removeLogsFromAll(bucket.splice(0,bucket.length-LOG_MAX_PER_THREAD));
+}
+
+function appendLogItem(item){
+  item._clientLogId=nextLogId++;
+  allLogs.push(item);
+  if(item.thread!==undefined&&item.thread!==null){
+    var key=String(item.thread);
+    if(!threadLogs[key])threadLogs[key]=[];
+    threadLogs[key].push(item);
+    trimLogBucket(threadLogs[key]);
+    ensureThreadTab(key);
+  }else{
+    unthreadedLogs.push(item);
+    trimLogBucket(unthreadedLogs);
+  }
 }
 
 function renderLogPanel(){
@@ -3252,13 +3280,7 @@ function pollLog(){
   fetch('/api/log-since/'+logCursor).then(function(r){return r.json()}).then(function(d){
     if(d.lines.length>0){
       d.lines.forEach(function(item){
-        allLogs.push(item);
-        if(item.thread!==undefined&&item.thread!==null){
-          var key=String(item.thread);
-          if(!threadLogs[key])threadLogs[key]=[];
-          threadLogs[key].push(item);
-          ensureThreadTab(key);
-        }
+        appendLogItem(item);
       });
       renderLogPanel();
     }
@@ -3524,7 +3546,7 @@ function stopReg(){
 
 function downloadResults(){window.open('/api/download');}
 function clearLog(){
-  allLogs=[];threadLogs={};activeLogTab='all';
+  allLogs=[];threadLogs={};unthreadedLogs=[];activeLogTab='all';nextLogId=1;
   logTabsEl.innerHTML=`<button class="btn-neutral log-tab active" id="log-tab-all" type="button" onclick="setActiveLogTab('all')">全部</button>`;
   renderLogPanel();
 }
